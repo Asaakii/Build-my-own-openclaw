@@ -1,24 +1,31 @@
 from llm_client import LLMClientError, ask_model
+from soul import load_soul
 
 
 # 先只支持两个退出命令， 其他输入都当做普通聊天内容
 EXIT_COMMANDS = {"/exit", "/quit"}
 
-# 这是一条临时的 system 消息， 让模型知道当前的身份和行为规范
-# 第 1.3 步会把它移到独立的 SOUL.md 文件，不再写死在代码里
-SYSTEM_MESSAGE = {
-    "role": "system",
-    "content": "你是一个诚实、简洁的个人助手。你将根据用户的输入提供有用的信息和帮助。"
-}
-
 
 def main() -> int:
-    """运行终端聊天循环。"""
+    """运行终端聊天循环，并在本次运行期间维护会话历史"""
+    # 启动时读取人格文件，缺失或为空时不继续运行
+    # 这样不会在未知人格配置下悄悄启动Agent
+    try:
+        soul = load_soul()
+    except (FileNotFoundError, ValueError) as error:
+        print(f"无法启动个人 Agent: {error}")
+        return 1
+
     print("个人 Agent 已启动。输入 '/exit' 或 '/quit' 退出。")
 
-    # 列表保存本次运行的完整会话
-    # 初始只有 system 消息，后续会按 user 和 assistant 的顺序追加消息
-    conversation: list[dict[str, str]] = [SYSTEM_MESSAGE]
+    # SOUL.md 的内容作为 system 消息，保证模型在本次会话中都能看到
+    # 在后续的每次请求中，都会把历史消息和 system 消息一起发送给模型
+    conversation: list[dict[str, str]] = [
+        {
+            "role": "system",
+            "content": soul
+        }
+    ]
 
     while True:
         try:
