@@ -20,6 +20,7 @@ class ModelConfig:
     provider: str
     model: str
     api_key: str
+    timeout_seconds: float
 
 
 def get_required_setting(name: str) -> str:
@@ -31,21 +32,44 @@ def get_required_setting(name: str) -> str:
     return value
 
 
+def get_timeout_seconds() -> float:
+    """读取超时秒数，并确保它是大于 0 的数字"""
+    raw_value = os.getenv("LLM_TIMEOUT_SECONDS", "30").strip()
+
+    try:
+        timeout_seconds = float(raw_value)
+    except ValueError as error:
+        raise ValueError(
+            f"LLM_TIMEOUT_SECONDS 必须是大于 0 的数字。"
+        ) from error
+
+    if timeout_seconds <= 0:
+        raise ValueError(
+            f"LLM_TIMEOUT_SECONDS 必须是大于 0 的数字。"
+        )
+
+    return timeout_seconds
+
+
 def load_model_config() -> ModelConfig:
+    """将分散的环境变量整理为不可变配置对象"""
     return ModelConfig(
         provider = get_required_setting("LLM_PROVIDER"),
         model = get_required_setting("LLM_MODEL"),
         api_key = get_required_setting("LLM_API_KEY"),
+        timeout_seconds = get_timeout_seconds(),
     )
 
 
 def describe_model_config() -> str:
+    """输出可安全展示的配置摘要，不输出 API key"""
     config = load_model_config()
     
     return "\n".join(
         [
             f"模型供应商: {config.provider}",
             f"模型名称: {config.model}",
+            f"请求超时秒数：{config.timeout_seconds}",
             f"API Key: 已配置（已隐藏）",
         ]
     )
