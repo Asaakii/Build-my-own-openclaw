@@ -33,13 +33,19 @@ def create_deepseek_client(config: ModelConfig) -> OpenAI:
     )
 
 
-def ask_model(user_message: str) -> str:
-    """向模型发送用户消息，并返回模型的回复。"""
-    message = user_message.strip()
-
-    # 空消息没有信息价值，直接拒绝，避免无意义的 API 请求和费用。
-    if not message:
+def ask_model(messages: list[dict[str, str]]) -> str:
+    """把完整回话历史发送给模型，并返回模型的回复。"""
+    if not messages:
         raise ValueError("消息不能为空")
+
+    # 每次请求的最后一条消息必须来自用户
+    # 这样模型才能知道当前需要回答什么
+    last_message = messages[-1]
+    if last_message.get("role") != "user":
+        raise ValueError("最后一条消息必须来自用户")
+
+    if not last_message.get("content", "").strip():
+        raise ValueError("最后一条消息内容不能为空")
 
     config = load_model_config()
     client = create_deepseek_client(config)
@@ -47,12 +53,8 @@ def ask_model(user_message: str) -> str:
     try:
         response = client.chat.completions.create(
             model=config.model,
-            messages=[
-                {
-                    "role": "user",
-                    "content": user_message,
-                }
-            ],
+            # 这里不再只传一条用户信息， 而是传入完整历史
+            messages=messages,
             # 首个版本限制回答长度， 便于控制成本
             max_tokens=512,
         )
