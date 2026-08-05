@@ -1,6 +1,6 @@
 import logging
 
-from llm_client import LLMClientError, ask_model
+from llm_client import LLMClientError, run_agent_turn
 from logging_config import configure_logging
 from soul import load_soul
 
@@ -27,7 +27,7 @@ def main() -> int:
 
     # SOUL.md 的内容作为 system 消息，保证模型在本次会话中都能看到
     # 在后续的每次请求中，都会把历史消息和 system 消息一起发送给模型
-    conversation: list[dict[str, str]] = [
+    conversation: list[dict[str, object]] = [
         {
             "role": "system",
             "content": soul
@@ -54,6 +54,10 @@ def main() -> int:
             print("聊天已结束。")
             return 0
 
+        # 记录本轮开始前的长度。
+        # 若工具调用中途失败，删除本轮所有新增消息，而不是只删一条。
+        turn_start_index = len(conversation)
+
         # 先记录用户问题，保证模型请求能看到它
         conversation.append(
             {
@@ -63,22 +67,14 @@ def main() -> int:
         )
 
         try:
-            answer = ask_model(conversation)
+            answer = run_agent_turn(conversation)
         except (ValueError, LLMClientError) as error:
-            # 调用失败时移除刚追加的用户消息，避免下一次请求时重复发送
-            # 否则历史会以 user 消息结尾，下一轮角色顺序就会出错
-            conversation.pop()
+            # 工具循环可能已追加 assistant 与 tool 消息。
+            # 因此回滚整轮，保持下一次会话历史完整。
+            del conversation[turn_start_index:]
+            logger.warning("Agent 回合失败: %s", error)
             print(f"模型请求失败: {error}")
             continue
-
-        # 只有模型成功回答后，才把回答写入历史
-        # 下一轮请求便能看到这条 assistant 消息，保证角色顺序正确
-        conversation.append(
-            {
-                "role": "assistant",
-                "content": answer,
-            }
-        )
 
         print(f"\nAgent: {answer}")
 
