@@ -2,6 +2,11 @@ import logging
 
 from llm_client import LLMClientError, run_agent_turn
 from logging_config import configure_logging
+from session_store import (
+    SessionStoreError,
+    append_session_messages,
+    load_session_messages,
+)
 from soul import load_soul
 
 
@@ -23,16 +28,30 @@ def main() -> int:
         print(f"无法启动个人 Agent: {error}")
         return 1
 
-    print("个人 Agent 已启动。输入 '/exit' 或 '/quit' 退出。")
+    # 加载上次已成功完成的对话记录。
+    try:
+        loaded_session = load_session_messages()
+    except SessionStoreError as error:
+        logger.error("会话加载失败: %s", error)
+        print(f"无法启动个人 Agent: {error}")
+        return 1
 
-    # SOUL.md 的内容作为 system 消息，保证模型在本次会话中都能看到
-    # 在后续的每次请求中，都会把历史消息和 system 消息一起发送给模型
+    # system 消息始终使用当前 SOUL.md，不从旧会话中恢复。
     conversation: list[dict[str, object]] = [
         {
             "role": "system",
-            "content": soul
-        }
+            "content": soul,
+        },
+        *loaded_session.messages,
     ]
+
+    print("个人 Agent 已启动。输入 '/exit' 或 '/quit' 退出。")
+
+    if loaded_session.messages:
+        print(f"已恢复 {len(loaded_session.messages)} 条历史消息。")
+
+    if loaded_session.skipped_lines:
+        print(f"提示：已跳过 {loaded_session.skipped_lines} 条损坏的本地会话记录。")
 
     while True:
         try:
@@ -74,6 +93,18 @@ def main() -> int:
             del conversation[turn_start_index:]
             logger.warning("Agent 回合失败: %s", error)
             print(f"模型请求失败: {error}")
+            continue
+
+        # 只有模型和工具都完成后，才把完整的一轮消息写入 JSONL。
+        new_messages = conversation[turn_start_index:]
+
+        try:
+            append_session_messages(new_messages)
+        except SessionStoreError as error:
+            # 回答已经生成，仍然展示；只是明确提示本轮无法跨重启恢复。
+            logger.error("会话保存失败: message_count=%d", len(new_messages))
+            print(f"\nAgent: {answer}")
+            print(f"提示：本轮回答已生成，但本地会话保存失败：{error}")
             continue
 
         print(f"\nAgent: {answer}")
