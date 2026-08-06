@@ -6,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 
 from memory_tools import MEMORY_TOOL_DEFINITIONS, execute_memory_tool
+from weather_tools import WEATHER_TOOL_DEFINITIONS, execute_weather_tool
 
 
 logger = logging.getLogger(__name__)
@@ -129,6 +130,9 @@ TOOL_DEFINITIONS: list[dict[str, object]] = [
 
 # 长期记忆工具独立定义，再加入统一的模型工具清单。
 TOOL_DEFINITIONS.extend(MEMORY_TOOL_DEFINITIONS)
+
+# 天气工具独立定义，再加入统一的模型工具清单。
+TOOL_DEFINITIONS.extend(WEATHER_TOOL_DEFINITIONS)
 
 
 def get_current_time() -> str:
@@ -289,6 +293,9 @@ def execute_tool(
             arguments,
             authorized_memory_content,
         )
+
+    if tool_name == "get_current_weather":
+        return execute_weather_tool(tool_name, arguments)
 
     if tool_name == "get_current_time":
         if arguments:

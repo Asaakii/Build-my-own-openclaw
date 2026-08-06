@@ -24,3 +24,6 @@ def configure_logging() -> None:
         # 防止多次初始化时重复添加日志处理器
         force=True,
     )
+
+    # httpx 的请求日志可能包含地理编码 URL 和城市名，因此默认不写入日志。
+    logging.getLogger("httpx").setLevel(logging.WARNING)
