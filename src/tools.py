@@ -7,6 +7,7 @@ from pathlib import Path
 
 from memory_tools import MEMORY_TOOL_DEFINITIONS, execute_memory_tool
 from weather_tools import WEATHER_TOOL_DEFINITIONS, execute_weather_tool
+from skill_tools import SKILL_TOOL_DEFINITIONS, execute_skill_tool
 
 
 logger = logging.getLogger(__name__)
@@ -133,6 +134,9 @@ TOOL_DEFINITIONS.extend(MEMORY_TOOL_DEFINITIONS)
 
 # 天气工具独立定义，再加入统一的模型工具清单。
 TOOL_DEFINITIONS.extend(WEATHER_TOOL_DEFINITIONS)
+
+# 技能工具独立定义，再加入统一的模型工具清单。
+TOOL_DEFINITIONS.extend(SKILL_TOOL_DEFINITIONS)
 
 
 def get_current_time() -> str:
@@ -296,6 +300,9 @@ def execute_tool(
 
     if tool_name == "get_current_weather":
         return execute_weather_tool(tool_name, arguments)
+
+    if tool_name == "load_skill":
+        return execute_skill_tool(tool_name, arguments)
 
     if tool_name == "get_current_time":
         if arguments:
