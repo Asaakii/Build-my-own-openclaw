@@ -5,6 +5,7 @@ __pycache__/
 sessions/
 logs/
 workspace/notes/
+workspace/MEMORY.md
 
 # 本机复盘文档，可能包含项目过程与环境信息，不提交到远程仓库。
 实际指导过程复盘.md

@@ -5,6 +5,8 @@ import operator
 from datetime import datetime
 from pathlib import Path
 
+from memory_tools import MEMORY_TOOL_DEFINITIONS, execute_memory_tool
+
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +126,9 @@ TOOL_DEFINITIONS: list[dict[str, object]] = [
         },
     },
 ]
+
+# 长期记忆工具独立定义，再加入统一的模型工具清单。
+TOOL_DEFINITIONS.extend(MEMORY_TOOL_DEFINITIONS)
 
 
 def get_current_time() -> str:
@@ -270,9 +275,20 @@ def write_note(filename: str, content: str) -> str:
     return f"笔记已创建：{filename}"
 
 
-def execute_tool(tool_name: str, arguments: dict[str, object]) -> str:
+def execute_tool(
+    tool_name: str,
+    arguments: dict[str, object],
+    authorized_memory_content: str | None = None,
+) -> str:
     """执行白名单工具，并在执行前再次校验参数。"""
     logger.info("开始执行工具: tool_name=%s", tool_name)
+
+    if tool_name in {"save_memory", "search_memory"}:
+        return execute_memory_tool(
+            tool_name,
+            arguments,
+            authorized_memory_content,
+        )
 
     if tool_name == "get_current_time":
         if arguments:

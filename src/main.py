@@ -17,6 +17,7 @@ from soul import load_soul
 
 # 先只支持两个退出命令， 其他输入都当做普通聊天内容
 EXIT_COMMANDS = {"/exit", "/quit"}
+MEMORY_COMMAND_PREFIX = "/remember "
 logger = logging.getLogger(__name__)
 
 
@@ -38,6 +39,29 @@ def build_conversation(
 
     conversation.extend(session_messages)
     return conversation
+
+
+def prepare_user_message(
+    user_message: str,
+) -> tuple[str, str | None]:
+    """识别 /remember 命令，并返回模型消息和本轮授权内容。"""
+    if not user_message.startswith(MEMORY_COMMAND_PREFIX):
+        return user_message, None
+
+    authorized_memory_content = user_message.removeprefix(
+        MEMORY_COMMAND_PREFIX
+    ).strip()
+
+    if not authorized_memory_content:
+        raise ValueError("/remember 后必须提供要保存的内容")
+
+    model_message = (
+        "用户已通过 /remember 明确授权保存以下长期记忆。"
+        "请调用 save_memory 工具，且 content 必须保持原文：\n"
+        f"{authorized_memory_content}"
+    )
+
+    return model_message, authorized_memory_content
 
 
 def main() -> int:
@@ -104,16 +128,27 @@ def main() -> int:
         # 若工具调用中途失败，删除本轮所有新增消息，而不是只删一条。
         turn_start_index = len(conversation)
 
+        try:
+            model_message, authorized_memory_content = prepare_user_message(
+                user_message
+            )
+        except ValueError as error:
+            print(f"命令使用错误：{error}")
+            continue
+
         # 先记录用户问题，保证模型请求能看到它
         conversation.append(
             {
                 "role": "user",
-                "content": user_message,
+                "content": model_message,
             }
         )
 
         try:
-            answer = run_agent_turn(conversation)
+            answer = run_agent_turn(
+                conversation,
+                authorized_memory_content,
+            )
         except (ValueError, LLMClientError) as error:
             # 工具循环可能已追加 assistant 与 tool 消息。
             # 因此回滚整轮，保持下一次会话历史完整。
