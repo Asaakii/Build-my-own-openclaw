@@ -3,6 +3,7 @@ import logging
 import math
 import operator
 from datetime import datetime
+from pathlib import Path
 
 
 logger = logging.getLogger(__name__)
@@ -11,6 +12,16 @@ logger = logging.getLogger(__name__)
 MAX_EXPRESSION_LENGTH = 100
 MAX_ABSOLUTE_VALUE = 10**12
 MAX_ABSOLUTE_EXPONENT = 20
+
+# 限制笔记名称和内容，避免工具被用来写入过大的数据。
+MAX_NOTE_NAME_LENGTH = 80
+MAX_NOTE_CONTENT_LENGTH = 4_000
+
+# tools.py 位于 src/ 中，因此上两级目录就是项目根目录。
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+# 所有笔记都只能放在这个目录中。
+NOTES_DIRECTORY = (PROJECT_ROOT / "workspace" / "notes").resolve()
 
 # 只允许这些二元运算符。
 BINARY_OPERATORS = {
@@ -65,6 +76,49 @@ TOOL_DEFINITIONS: list[dict[str, object]] = [
                     },
                 },
                 "required": ["expression"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_note",
+            "description": "读取 workspace/notes 目录中的一份 Markdown 笔记。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filename": {
+                        "type": "string",
+                        "description": "笔记文件名，例如：study-note.md",
+                    },
+                },
+                "required": ["filename"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_note",
+            "description": (
+                "在 workspace/notes 目录中新建一份 Markdown 笔记。"
+                "同名笔记不会被覆盖。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filename": {
+                        "type": "string",
+                        "description": "新笔记文件名，例如：study-note.md",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "要写入笔记的正文内容。",
+                    },
+                },
+                "required": ["filename", "content"],
                 "additionalProperties": False,
             },
         },
@@ -141,6 +195,81 @@ def calculate(expression: str) -> str:
     return str(result)
 
 
+def get_note_path(filename: str) -> Path:
+    """验证文件名，并返回确定处于笔记目录内的绝对路径。"""
+    if not filename or len(filename) > MAX_NOTE_NAME_LENGTH:
+        raise ValueError("笔记文件名为空或过长")
+
+    candidate = Path(filename)
+
+    # 文件名必须是单个 .md 名称，不能含 ../、绝对路径或隐藏文件名。
+    if (
+        candidate.is_absolute()
+        or len(candidate.parts) != 1
+        or candidate.name != filename
+        or "/" in filename
+        or "\\" in filename
+        or filename.startswith(".")
+        or not filename.endswith(".md")
+    ):
+        raise ValueError("笔记文件名必须是单个 .md 文件名，不能包含路径")
+
+    # resolve() 会处理符号链接；relative_to() 是真正的目录边界检查。
+    note_path = (NOTES_DIRECTORY / filename).resolve()
+
+    try:
+        note_path.relative_to(NOTES_DIRECTORY)
+    except ValueError as error:
+        raise ValueError("笔记路径超出允许目录") from error
+
+    return note_path
+
+
+def read_note(filename: str) -> str:
+    """读取一份受限目录中的 UTF-8 Markdown 笔记。"""
+    note_path = get_note_path(filename)
+
+    if not note_path.exists():
+        raise ValueError("笔记不存在")
+
+    if not note_path.is_file():
+        raise ValueError("笔记路径不是普通文件")
+
+    # UTF-8 的一个字符最多占 4 个字节，先限制文件体积，
+    # 避免超大文件在读取时一次性占用大量内存。
+    if note_path.stat().st_size > MAX_NOTE_CONTENT_LENGTH * 4:
+        raise ValueError("笔记内容超过读取上限")
+
+    content = note_path.read_text(encoding="utf-8")
+
+    # 再按字符数检查，保证模型收到的文本也不会过长。
+    if len(content) > MAX_NOTE_CONTENT_LENGTH:
+        raise ValueError("笔记内容超过读取上限")
+
+    return content
+
+
+def write_note(filename: str, content: str) -> str:
+    """创建新笔记；同名文件一律拒绝覆盖。"""
+    if not content.strip():
+        raise ValueError("笔记内容不能为空")
+
+    if len(content) > MAX_NOTE_CONTENT_LENGTH:
+        raise ValueError("笔记内容超过写入上限")
+
+    note_path = get_note_path(filename)
+    NOTES_DIRECTORY.mkdir(parents=True, exist_ok=True)
+
+    try:
+        # x 模式只允许创建新文件，文件已存在时会抛出 FileExistsError。
+        with note_path.open("x", encoding="utf-8") as note_file:
+            note_file.write(content)
+    except FileExistsError as error:
+        raise ValueError("同名笔记已经存在，首版不允许覆写") from error
+
+    return f"笔记已创建：{filename}"
+
+
 def execute_tool(tool_name: str, arguments: dict[str, object]) -> str:
     """执行白名单工具，并在执行前再次校验参数。"""
     logger.info("开始执行工具: tool_name=%s", tool_name)
@@ -164,6 +293,42 @@ def execute_tool(tool_name: str, arguments: dict[str, object]) -> str:
         except ValueError as error:
             logger.warning("计算工具拒绝了无效表达式")
             return f"工具执行失败：{error}"
+
+    if tool_name == "read_note":
+        if set(arguments) != {"filename"}:
+            return "工具执行失败：read_note 需要且只接受 filename 参数"
+
+        filename = arguments["filename"]
+        if not isinstance(filename, str):
+            return "工具执行失败：filename 必须是文本"
+
+        try:
+            return read_note(filename)
+        except ValueError as error:
+            logger.warning("读取笔记被拒绝或失败")
+            return f"工具执行失败：{error}"
+        except OSError:
+            logger.warning("读取笔记时发生系统错误")
+            return "工具执行失败：读取笔记时发生异常"
+
+    if tool_name == "write_note":
+        if set(arguments) != {"filename", "content"}:
+            return "工具执行失败：write_note 需要 filename 和 content 参数"
+
+        filename = arguments["filename"]
+        content = arguments["content"]
+
+        if not isinstance(filename, str) or not isinstance(content, str):
+            return "工具执行失败：filename 和 content 必须是文本"
+
+        try:
+            return write_note(filename, content)
+        except ValueError as error:
+            logger.warning("写入笔记被拒绝或失败")
+            return f"工具执行失败：{error}"
+        except OSError:
+            logger.warning("写入笔记时发生系统错误")
+            return "工具执行失败：写入笔记时发生异常"
 
     logger.warning("拒绝未知工具: tool_name=%s", tool_name)
     return f"工具执行失败：不支持的工具 {tool_name}"
