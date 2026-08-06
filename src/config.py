@@ -43,6 +43,14 @@ class TelegramConfig:
     allowed_user_id: int
 
 
+@dataclass(frozen=True)
+class ReminderConfig:
+    """保存定时提醒任务的资源限制。"""
+
+    max_delay_seconds: int
+    max_active_tasks: int
+
+
 def get_required_setting(name: str) -> str:
     """读取必填环境变量，并拒绝空值。"""
     value = os.getenv(name, "").strip()
@@ -134,6 +142,50 @@ def get_telegram_allowed_user_id() -> int:
     return user_id
 
 
+def get_reminder_max_delay_seconds() -> int:
+    """读取单个提醒允许等待的最长秒数。"""
+    raw_value = os.getenv(
+        "REMINDER_MAX_DELAY_SECONDS",
+        "3600",
+    ).strip()
+
+    try:
+        max_delay_seconds = int(raw_value)
+    except ValueError as error:
+        raise ValueError(
+            "REMINDER_MAX_DELAY_SECONDS 必须是正整数。"
+        ) from error
+
+    if not 1 <= max_delay_seconds <= 86400:
+        raise ValueError(
+            "REMINDER_MAX_DELAY_SECONDS 必须在 1 到 86400 之间。"
+        )
+
+    return max_delay_seconds
+
+
+def get_reminder_max_active_tasks() -> int:
+    """读取同时允许存在的提醒数量上限。"""
+    raw_value = os.getenv(
+        "REMINDER_MAX_ACTIVE_TASKS",
+        "5",
+    ).strip()
+
+    try:
+        max_active_tasks = int(raw_value)
+    except ValueError as error:
+        raise ValueError(
+            "REMINDER_MAX_ACTIVE_TASKS 必须是正整数。"
+        ) from error
+
+    if not 1 <= max_active_tasks <= 20:
+        raise ValueError(
+            "REMINDER_MAX_ACTIVE_TASKS 必须在 1 到 20 之间。"
+        )
+
+    return max_active_tasks
+
+
 def load_model_config() -> ModelConfig:
     """将分散的环境变量整理为不可变配置对象"""
     return ModelConfig(
@@ -169,6 +221,14 @@ def load_telegram_config() -> TelegramConfig:
         request_timeout_seconds=connection_config.request_timeout_seconds,
         poll_timeout_seconds=poll_timeout_seconds,
         allowed_user_id=get_telegram_allowed_user_id(),
+    )
+
+
+def load_reminder_config() -> ReminderConfig:
+    """读取定时提醒任务的资源限制。"""
+    return ReminderConfig(
+        max_delay_seconds=get_reminder_max_delay_seconds(),
+        max_active_tasks=get_reminder_max_active_tasks(),
     )
 
 
