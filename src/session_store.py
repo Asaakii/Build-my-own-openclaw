@@ -53,9 +53,17 @@ def is_valid_summary_record(value: object) -> bool:
     )
 
 
-def load_session_messages() -> SessionLoadResult:
-    """读取 JSONL 会话文件，跳过损坏行并保留其他有效记录。"""
-    if not SESSION_FILE.exists():
+def load_session_messages(
+    session_file_path: Path | None = None,
+) -> SessionLoadResult:
+    """读取指定 JSONL 会话文件，跳过损坏行并保留其他有效记录。
+
+    不传入路径时，继续读取当前终端 Agent 使用的默认会话文件；
+    迁移时会传入备份文件路径，确保导入内容就是已备份的版本。
+    """
+    source_file = session_file_path or SESSION_FILE
+
+    if not source_file.exists():
         return SessionLoadResult(
             messages=[],
             summary=None,
@@ -67,7 +75,7 @@ def load_session_messages() -> SessionLoadResult:
     skipped_lines = 0
 
     try:
-        with SESSION_FILE.open("r", encoding="utf-8") as session_file:
+        with source_file.open("r", encoding="utf-8") as session_file:
             for line_number, line in enumerate(session_file, start=1):
                 # 空行没有信息，直接忽略，不视为损坏记录。
                 if not line.strip():

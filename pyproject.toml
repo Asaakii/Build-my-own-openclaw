@@ -55,6 +55,8 @@ py-modules = [
     "tools",
     "weather",
     "weather_tools",
+    "sqlite_state_store",
+    "legacy_session_migration",
 ]
 
 [tool.setuptools.packages.find]
