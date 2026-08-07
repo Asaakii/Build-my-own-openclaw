@@ -51,6 +51,15 @@ class ReminderConfig:
     max_active_tasks: int
 
 
+@dataclass(frozen=True)
+class GatewayConfig:
+    """保存仅供本机 Gateway 使用的监听与认证配置。"""
+
+    host: str
+    port: int
+    token: str
+
+
 def get_required_setting(name: str) -> str:
     """读取必填环境变量，并拒绝空值。"""
     value = os.getenv(name, "").strip()
@@ -229,6 +238,64 @@ def load_reminder_config() -> ReminderConfig:
     return ReminderConfig(
         max_delay_seconds=get_reminder_max_delay_seconds(),
         max_active_tasks=get_reminder_max_active_tasks(),
+    )
+
+
+def get_gateway_host() -> str:
+    """只允许 Gateway 绑定本机回环地址。"""
+    host = os.getenv(
+        "MYCLAW_GATEWAY_HOST",
+        "127.0.0.1",
+    ).strip()
+
+    if host != "127.0.0.1":
+        raise ValueError(
+            "MYCLAW_GATEWAY_HOST 只能是 127.0.0.1。"
+        )
+
+    return host
+
+
+def get_gateway_port() -> int:
+    """读取非特权本机端口，拒绝无效范围。"""
+    raw_value = os.getenv(
+        "MYCLAW_GATEWAY_PORT",
+        "18790",
+    ).strip()
+
+    try:
+        port = int(raw_value)
+    except ValueError as error:
+        raise ValueError(
+            "MYCLAW_GATEWAY_PORT 必须是 1024 到 65535 的整数。"
+        ) from error
+
+    if not 1024 <= port <= 65535:
+        raise ValueError(
+            "MYCLAW_GATEWAY_PORT 必须是 1024 到 65535 的整数。"
+        )
+
+    return port
+
+
+def get_gateway_token() -> str:
+    """读取 Gateway Token，并拒绝过短的值。"""
+    token = get_required_setting("MYCLAW_GATEWAY_TOKEN")
+
+    if len(token) < 32:
+        raise ValueError(
+            "MYCLAW_GATEWAY_TOKEN 至少需要 32 个字符。"
+        )
+
+    return token
+
+
+def load_gateway_config() -> GatewayConfig:
+    """整理 Gateway 的本机监听与认证配置。"""
+    return GatewayConfig(
+        host=get_gateway_host(),
+        port=get_gateway_port(),
+        token=get_gateway_token(),
     )
 
 

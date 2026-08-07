@@ -57,6 +57,8 @@ py-modules = [
     "weather_tools",
     "sqlite_state_store",
     "legacy_session_migration",
+    "gateway_server",
+    "gateway_client",
 ]
 
 [tool.setuptools.packages.find]

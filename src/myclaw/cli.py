@@ -2,7 +2,19 @@ import argparse
 from collections.abc import Sequence
 from importlib.metadata import PackageNotFoundError, version
 
-from config import describe_model_config
+from config import (
+    describe_model_config,
+    load_gateway_config,
+)
+from gateway_client import (
+    GatewayClientError,
+    get_gateway_status,
+)
+from gateway_server import (
+    GatewayServerError,
+    serve_gateway,
+)
+from logging_config import configure_logging
 
 
 PACKAGE_NAME = "myclaw"
@@ -50,6 +62,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="检查模型配置，并隐藏 API Key。",
     )
 
+    gateway_parser = subparsers.add_parser(
+        "gateway",
+        help="管理本机 Gateway。",
+    )
+    gateway_subparsers = gateway_parser.add_subparsers(
+        dest="gateway_command",
+        required=True,
+        metavar="GATEWAY_COMMAND",
+    )
+    gateway_subparsers.add_parser(
+        "run",
+        help="以前台方式启动本机 Gateway。",
+    )
+    gateway_subparsers.add_parser(
+        "status",
+        help="查询本机 Gateway 状态。",
+    )
+
     return parser
 
 
@@ -61,6 +91,51 @@ def run_config_check() -> int:
         print(f"配置检查失败: {error}")
         return 1
 
+    return 0
+
+
+def run_gateway() -> int:
+    """加载本机配置并以前台方式启动 Gateway。"""
+    try:
+        config = load_gateway_config()
+    except ValueError as error:
+        print(f"Gateway 配置失败: {error}")
+        return 1
+
+    # Gateway 的启动、停止和请求事件写入本机脱敏日志。
+    configure_logging()
+
+    try:
+        serve_gateway(config)
+    except GatewayServerError as error:
+        print(f"Gateway 启动失败: {error}")
+        return 1
+    except KeyboardInterrupt:
+        print("Gateway 已停止。")
+        return 0
+
+    return 0
+
+
+def run_gateway_status() -> int:
+    """通过 Gateway 客户端查询状态，绝不在 CLI 中直接读取状态层。"""
+    try:
+        config = load_gateway_config()
+        status = get_gateway_status(config)
+    except (ValueError, GatewayClientError) as error:
+        print(f"Gateway 状态查询失败: {error}")
+        return 1
+
+    print(
+        "\n".join(
+            [
+                f"Gateway 状态: {status.status}",
+                f"Gateway 版本: {status.version}",
+                f"启动时间: {status.started_at}",
+                f"监听地址: {status.address}",
+            ]
+        )
+    )
     return 0
 
 
@@ -76,6 +151,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         and arguments.config_command == "check"
     ):
         return run_config_check()
+
+    if (
+        arguments.command == "gateway"
+        and arguments.gateway_command == "run"
+    ):
+        return run_gateway()
+
+    if (
+        arguments.command == "gateway"
+        and arguments.gateway_command == "status"
+    ):
+        return run_gateway_status()
 
     # 目前理论上不会到这里；保留此分支便于未来增加命令时安全失败。
     parser.error("不支持的命令")
