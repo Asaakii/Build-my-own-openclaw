@@ -1,0 +1,62 @@
+[build-system]
+# setuptools 负责把项目构建和安装为 Python 包。
+requires = ["setuptools>=77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "myclaw"
+version = "0.1.0"
+description = "学习用的本机单用户 Agent Gateway 项目"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "openai==2.53.0",
+    "httpx==0.28.1",
+    "python-dotenv==1.2.2",
+]
+
+# 测试依赖不属于运行时依赖，安装开发环境时才需要。
+[project.optional-dependencies]
+dev = [
+    "pytest==9.1.1",
+]
+
+# 安装项目后，myclaw 命令会调用 myclaw.cli 模块中的 main 函数。
+[project.scripts]
+myclaw = "myclaw.cli:main"
+
+[tool.setuptools]
+# 继续沿用当前 src 目录布局，不在本步骤迁移旧模块。
+package-dir = {"" = "src"}
+
+# 当前旧模块仍使用顶层 import，例如 from config import ...。
+# 显式列出它们，确保安装后的 myclaw 命令也能导入现有核心代码。
+py-modules = [
+    "agent_runtime",
+    "channel",
+    "check_environment",
+    "config",
+    "context_manager",
+    "llm_client",
+    "logging_config",
+    "main",
+    "memory_store",
+    "memory_tools",
+    "reminder_scheduler",
+    "session_store",
+    "skill_loader",
+    "skill_tools",
+    "soul",
+    "telegram_api",
+    "telegram_channel",
+    "telegram_main",
+    "telegram_setup",
+    "terminal_channel",
+    "tools",
+    "weather",
+    "weather_tools",
+]
+
+[tool.setuptools.packages.find]
+# 自动发现新建的 myclaw 包。
+where = ["src"]

@@ -1,0 +1,86 @@
+import argparse
+from collections.abc import Sequence
+from importlib.metadata import PackageNotFoundError, version
+
+from config import describe_model_config
+
+
+PACKAGE_NAME = "myclaw"
+
+
+def get_installed_version() -> str:
+    """读取已安装包的版本；未安装时给开发阶段一个明确标记。"""
+    try:
+        return version(PACKAGE_NAME)
+    except PackageNotFoundError:
+        return "开发版（未安装）"
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """集中定义 CLI 命令结构，后续 Gateway 命令会继续加在这里。"""
+    parser = argparse.ArgumentParser(
+        prog=PACKAGE_NAME,
+        description="本机个人 Agent 的 Gateway 与 CLI 工具。",
+    )
+
+    # argparse 会在处理 --version 后自行输出版本并正常退出。
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {get_installed_version()}",
+    )
+
+    subparsers = parser.add_subparsers(
+        dest="command",
+        required=True,
+        metavar="COMMAND",
+    )
+
+    config_parser = subparsers.add_parser(
+        "config",
+        help="检查本机配置。",
+    )
+    config_subparsers = config_parser.add_subparsers(
+        dest="config_command",
+        required=True,
+        metavar="CONFIG_COMMAND",
+    )
+    config_subparsers.add_parser(
+        "check",
+        help="检查模型配置，并隐藏 API Key。",
+    )
+
+    return parser
+
+
+def run_config_check() -> int:
+    """复用已有的安全配置摘要，绝不输出真实 API Key。"""
+    try:
+        print(describe_model_config())
+    except ValueError as error:
+        print(f"配置检查失败: {error}")
+        return 1
+
+    return 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """解析 CLI 参数，并执行当前已经支持的最小命令集。"""
+    parser = build_parser()
+    arguments = parser.parse_args(
+        list(argv) if argv is not None else None
+    )
+
+    if (
+        arguments.command == "config"
+        and arguments.config_command == "check"
+    ):
+        return run_config_check()
+
+    # 目前理论上不会到这里；保留此分支便于未来增加命令时安全失败。
+    parser.error("不支持的命令")
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

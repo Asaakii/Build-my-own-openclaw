@@ -9,3 +9,8 @@ workspace/MEMORY.md
 
 # 本机复盘文档，可能包含项目过程与环境信息，不提交到远程仓库。
 实际指导过程复盘.md
+
+# Python 打包和 editable 安装生成的构建产物，不提交 Git。
+*.egg-info/
+build/
+dist/
