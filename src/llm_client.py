@@ -12,6 +12,7 @@ from openai import (
 
 from config import ModelConfig, load_model_config
 from tools import TOOL_DEFINITIONS, execute_tool
+from collections.abc import Callable
 
 
 # 这里固定使用 DeepSeek 作为供应商，后续可以扩展为支持其他供应商
@@ -210,6 +211,7 @@ def serialize_assistant_tool_message(message) -> dict[str, object]:
 def run_agent_turn(
     messages: list[dict[str, object]],
     authorized_memory_content: str | None = None,
+    on_tool_start: Callable[[str], None] | None = None,
 ) -> str:
     """执行一个完整 Agent 回合，期间最多执行 3 次工具。"""
     if not messages:
@@ -268,7 +270,11 @@ def run_agent_turn(
                     tool_result = "工具执行失败: 参数必须是 JSON 对象"
                 else:
                     # 只展示工具名称，不展示模型传入的参数。
-                    print(f"正在使用工具: {tool_name}")
+                    if on_tool_start is not None:
+                        on_tool_start(tool_name)
+                    else:
+                        # 保持旧终端 Agent 的原有可见提示。
+                        print(f"正在使用工具: {tool_name}")
                     tool_result = execute_tool(
                         tool_name,
                         arguments,

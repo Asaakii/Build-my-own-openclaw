@@ -5,6 +5,7 @@ from config import GatewayConfig
 from gateway_client import (
     GatewayClientError,
     GatewayStatus,
+    GatewayMessageResult,
 )
 
 
@@ -151,3 +152,84 @@ def test_gateway_run_delegates_to_server(
 
     assert exit_code == 0
     assert called_configs == [config]
+
+
+def test_chat_sends_message_only_through_gateway_client(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """chat 命令只委托 Gateway 客户端，不直接运行 Agent。"""
+    config = GatewayConfig(
+        host="127.0.0.1",
+        port=18790,
+        token="test-token-with-at-least-thirty-two-characters",
+    )
+    received_arguments: list[tuple[GatewayConfig, str, str]] = []
+
+    monkeypatch.setattr(
+        cli,
+        "load_gateway_config",
+        lambda: config,
+    )
+    monkeypatch.setattr(
+        cli,
+        "send_gateway_message",
+        lambda received_config, session_id, text: (
+            received_arguments.append(
+                (received_config, session_id, text)
+            )
+            or GatewayMessageResult(
+                reply="测试回答",
+                compressed_message_count=0,
+            )
+        ),
+    )
+
+    exit_code = cli.main(
+        [
+            "chat",
+            "测试消息",
+            "--session-id",
+            "local:cli-test",
+        ]
+    )
+
+    assert exit_code == 0
+    assert received_arguments == [
+        (config, "local:cli-test", "测试消息")
+    ]
+    assert "Agent: 测试回答" in capsys.readouterr().out
+
+
+def test_chat_returns_safe_error_when_gateway_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Gateway 请求失败时，chat 命令不得改为直接调用 Agent。"""
+    monkeypatch.setattr(
+        cli,
+        "load_gateway_config",
+        lambda: GatewayConfig(
+            host="127.0.0.1",
+            port=18790,
+            token="test-token-with-at-least-thirty-two-characters",
+        ),
+    )
+
+    def raise_gateway_error(
+        _config: GatewayConfig,
+        _session_id: str,
+        _text: str,
+    ) -> GatewayMessageResult:
+        raise GatewayClientError("Gateway 不可用")
+
+    monkeypatch.setattr(
+        cli,
+        "send_gateway_message",
+        raise_gateway_error,
+    )
+
+    exit_code = cli.main(["chat", "测试消息"])
+
+    assert exit_code == 1
+    assert "消息发送失败" in capsys.readouterr().out

@@ -59,6 +59,7 @@ py-modules = [
     "legacy_session_migration",
     "gateway_server",
     "gateway_client",
+    "gateway_agent_runtime",
 ]
 
 [tool.setuptools.packages.find]

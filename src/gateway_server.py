@@ -1,16 +1,28 @@
 import hmac
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from importlib.metadata import PackageNotFoundError, version
 
 from config import GatewayConfig
+from gateway_agent_runtime import (
+    GatewayAgentError,
+    GatewayAgentRuntime,
+)
+from sqlite_state_store import SQLiteStateStore
 
 
 logger = logging.getLogger(__name__)
 
 PACKAGE_NAME = "myclaw"
+
+MAX_REQUEST_BODY_BYTES = 8_000
+MAX_MESSAGE_CHARACTERS = 2_000
+SESSION_MESSAGE_PATH_PATTERN = re.compile(
+    r"^/sessions/([A-Za-z0-9][A-Za-z0-9:_-]{0,119})/messages$"
+)
 
 
 class GatewayServerError(RuntimeError):
@@ -18,7 +30,7 @@ class GatewayServerError(RuntimeError):
 
 
 def get_gateway_version() -> str:
-    """读取已安装包版本；开发环境无法读取时使用明确标记。"""
+    """读取已安装包版本；未安装时给开发阶段一个明确标记。"""
     try:
         return version(PACKAGE_NAME)
     except PackageNotFoundError:
@@ -26,40 +38,39 @@ def get_gateway_version() -> str:
 
 
 class GatewayHTTPServer(HTTPServer):
-    """保存 Gateway 运行元数据的本机 HTTP 服务。"""
+    """保存 Gateway 运行元数据和专用 Agent 运行器。"""
 
     def __init__(
         self,
         config: GatewayConfig,
+        agent_runtime: GatewayAgentRuntime | None = None,
     ) -> None:
         super().__init__(
             (config.host, config.port),
             GatewayRequestHandler,
         )
         self.gateway_config = config
+        self.agent_runtime = agent_runtime
         self.started_at = datetime.now(
             timezone.utc
         ).isoformat()
 
 
 class GatewayRequestHandler(BaseHTTPRequestHandler):
-    """只提供受 Token 保护的健康和状态接口。"""
+    """处理已经过 Token 保护的 Gateway 最小接口。"""
 
     server_version = "MyClawGateway"
     sys_version = ""
 
     def do_GET(self) -> None:
-        """处理当前允许的只读请求。"""
+        """处理健康检查和状态查询。"""
         if not self.is_authorized():
             return
 
         path = self.path.split("?", maxsplit=1)[0]
 
         if path == "/health":
-            self.send_json(
-                200,
-                {"status": "ok"},
-            )
+            self.send_json(200, {"status": "ok"})
             return
 
         if path == "/status":
@@ -77,20 +88,159 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
             )
             return
 
-        self.send_json(
-            404,
-            {"error": "not_found"},
-        )
+        self.send_json(404, {"error": "not_found"})
 
     def do_POST(self) -> None:
-        """消息接口尚未实现，先明确拒绝所有写请求。"""
+        """处理受限的会话消息请求。"""
         if not self.is_authorized():
             return
 
-        self.send_json(
-            405,
-            {"error": "method_not_allowed"},
+        path = self.path.split("?", maxsplit=1)[0]
+
+        # /health 和 /status 是已知只读接口。
+        # 使用错误方法访问时应返回 405，而不是伪装成不存在。
+        if path in {"/health", "/status"}:
+            self.send_json(
+                405,
+                {"error": "method_not_allowed"},
+            )
+            return
+
+        matched_path = SESSION_MESSAGE_PATH_PATTERN.fullmatch(
+            path
         )
+
+        if matched_path is None:
+            self.send_json(404, {"error": "not_found"})
+            return
+
+        text = self.read_message_text()
+
+        if text is None:
+            return
+
+        if self.server.agent_runtime is None:
+            self.send_json(
+                503,
+                {"error": "message_service_unavailable"},
+            )
+            return
+
+        session_id = matched_path.group(1)
+
+        try:
+            result = self.server.agent_runtime.handle_text(
+                session_id,
+                text,
+            )
+        except GatewayAgentError as error:
+            logger.warning(
+                "Gateway 消息处理失败: error_type=%s",
+                type(error).__name__,
+            )
+            self.send_json(
+                500,
+                {"error": "agent_request_failed"},
+            )
+            return
+
+        self.send_json(
+            200,
+            {
+                "reply": result.reply,
+                "compressed_message_count": str(
+                    result.compressed_message_count
+                ),
+            },
+        )
+
+    def read_message_text(self) -> str | None:
+        """读取并严格校验 JSON 请求体，不回显用户输入。"""
+        content_type = self.headers.get(
+            "Content-Type",
+            "",
+        ).split(";", maxsplit=1)[0].strip().lower()
+
+        if content_type != "application/json":
+            self.send_json(
+                415,
+                {"error": "unsupported_media_type"},
+            )
+            return None
+
+        raw_content_length = self.headers.get(
+            "Content-Length",
+        )
+
+        if raw_content_length is None:
+            self.send_json(
+                411,
+                {"error": "content_length_required"},
+            )
+            return None
+
+        try:
+            content_length = int(raw_content_length)
+        except ValueError:
+            self.send_json(
+                400,
+                {"error": "invalid_content_length"},
+            )
+            return None
+
+        if content_length < 0:
+            self.send_json(
+                400,
+                {"error": "invalid_content_length"},
+            )
+            return None
+
+        if content_length > MAX_REQUEST_BODY_BYTES:
+            self.send_json(
+                413,
+                {"error": "request_too_large"},
+            )
+            return None
+
+        raw_body = self.rfile.read(content_length)
+
+        try:
+            payload = json.loads(raw_body)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self.send_json(
+                400,
+                {"error": "invalid_json"},
+            )
+            return None
+
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != {"text"}
+            or not isinstance(payload["text"], str)
+        ):
+            self.send_json(
+                400,
+                {"error": "invalid_message_payload"},
+            )
+            return None
+
+        text = payload["text"].strip()
+
+        if not text:
+            self.send_json(
+                400,
+                {"error": "message_empty"},
+            )
+            return None
+
+        if len(text) > MAX_MESSAGE_CHARACTERS:
+            self.send_json(
+                413,
+                {"error": "message_too_long"},
+            )
+            return None
+
+        return text
 
     def is_authorized(self) -> bool:
         """在任何路由处理前校验 Token。"""
@@ -108,10 +258,7 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
         ):
             return True
 
-        self.send_json(
-            401,
-            {"error": "unauthorized"},
-        )
+        self.send_json(401, {"error": "unauthorized"})
         return False
 
     def send_json(
@@ -119,7 +266,7 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
         status_code: int,
         payload: dict[str, str],
     ) -> None:
-        """以 JSON 返回固定状态信息，不回显请求内容或 Token。"""
+        """返回固定 JSON，不回显 Token 或请求正文。"""
         body = json.dumps(
             payload,
             ensure_ascii=False,
@@ -142,7 +289,7 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
         _format: str,
         *_arguments: object,
     ) -> None:
-        """覆盖默认日志，避免记录请求头和潜在敏感内容。"""
+        """只记录方法和路径，不记录请求头或正文。"""
         path = self.path.split("?", maxsplit=1)[0]
         logger.info(
             "Gateway HTTP 请求完成: method=%s path=%s",
@@ -153,6 +300,7 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
 
 def create_gateway_server(
     config: GatewayConfig,
+    agent_runtime: GatewayAgentRuntime | None = None,
 ) -> GatewayHTTPServer:
     """创建仅绑定回环地址的 Gateway 服务实例。"""
     if config.host != "127.0.0.1":
@@ -167,7 +315,7 @@ def create_gateway_server(
         raise GatewayServerError("Gateway Token 无效。")
 
     try:
-        return GatewayHTTPServer(config)
+        return GatewayHTTPServer(config, agent_runtime)
     except OSError as error:
         logger.error(
             "Gateway 启动失败: error_type=%s",
@@ -181,8 +329,21 @@ def create_gateway_server(
 def serve_gateway(
     config: GatewayConfig,
 ) -> None:
-    """以前台方式运行 Gateway，并在停止时关闭监听端口。"""
-    server = create_gateway_server(config)
+    """初始化专用运行器后，以前台方式运行 Gateway。"""
+    try:
+        agent_runtime = GatewayAgentRuntime(
+            SQLiteStateStore()
+        )
+    except (FileNotFoundError, ValueError) as error:
+        logger.error(
+            "Gateway 运行器初始化失败: error_type=%s",
+            type(error).__name__,
+        )
+        raise GatewayServerError(
+            "无法初始化 Gateway Agent 运行器。"
+        ) from error
+
+    server = create_gateway_server(config, agent_runtime)
 
     logger.info(
         "Gateway 启动: host=%s port=%d",

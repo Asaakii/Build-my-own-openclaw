@@ -9,6 +9,8 @@ from config import (
 from gateway_client import (
     GatewayClientError,
     get_gateway_status,
+    GatewayMessageResult,
+    send_gateway_message,
 )
 from gateway_server import (
     GatewayServerError,
@@ -80,6 +82,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="查询本机 Gateway 状态。",
     )
 
+    chat_parser = subparsers.add_parser(
+        "chat",
+        help="通过 Gateway 向指定会话发送一条文字消息。",
+    )
+    chat_parser.add_argument(
+        "text",
+        help="要发送给 Agent 的文字消息。",
+    )
+    chat_parser.add_argument(
+        "--session-id",
+        default="local:default",
+        help="会话标识，默认使用 local:default。",
+    )
+
     return parser
 
 
@@ -139,6 +155,33 @@ def run_gateway_status() -> int:
     return 0
 
 
+def run_chat(
+    session_id: str,
+    text: str,
+) -> int:
+    """通过 Gateway 发送消息，CLI 不直接创建 Agent。"""
+    try:
+        config = load_gateway_config()
+        result = send_gateway_message(
+            config,
+            session_id,
+            text,
+        )
+    except (ValueError, GatewayClientError) as error:
+        print(f"消息发送失败: {error}")
+        return 1
+
+    print(f"Agent: {result.reply}")
+
+    if result.compressed_message_count:
+        print(
+            "提示：会话已压缩，"
+            f"总结了 {result.compressed_message_count} 条旧消息。"
+        )
+
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """解析 CLI 参数，并执行当前已经支持的最小命令集。"""
     parser = build_parser()
@@ -163,6 +206,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         and arguments.gateway_command == "status"
     ):
         return run_gateway_status()
+
+    if arguments.command == "chat":
+        return run_chat(
+            arguments.session_id,
+            arguments.text,
+        )
 
     # 目前理论上不会到这里；保留此分支便于未来增加命令时安全失败。
     parser.error("不支持的命令")
