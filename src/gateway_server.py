@@ -8,12 +8,16 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from config import GatewayConfig
+from config import GatewayConfig, load_reminder_config
 from gateway_agent_runtime import (
     GatewayAgentError,
     GatewayAgentRuntime,
 )
 from logging_config import LOG_FILE
+from persistent_reminder_service import (
+    PersistentReminderService,
+    ReminderTaskError,
+)
 from sqlite_state_store import SQLiteStateStore, StateStoreError
 
 
@@ -29,6 +33,7 @@ MAX_LOG_READ_BYTES = 256_000
 SESSION_MESSAGE_PATH_PATTERN = re.compile(
     r"^/sessions/([A-Za-z0-9][A-Za-z0-9:_-]{0,119})/messages$"
 )
+REMINDER_TASK_PATH = "/tasks/reminders"
 
 
 class GatewayServerError(RuntimeError):
@@ -51,6 +56,7 @@ class GatewayHTTPServer(HTTPServer):
         config: GatewayConfig,
         agent_runtime: GatewayAgentRuntime | None = None,
         log_file: Path = LOG_FILE,
+        reminder_service: PersistentReminderService | None = None,
     ) -> None:
         super().__init__(
             (config.host, config.port),
@@ -59,6 +65,7 @@ class GatewayHTTPServer(HTTPServer):
         self.gateway_config = config
         self.agent_runtime = agent_runtime
         self.log_file = log_file
+        self.reminder_service = reminder_service
         self.started_at = datetime.now(
             timezone.utc
         ).isoformat()
@@ -105,6 +112,10 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
             self.handle_log_list(request_url.query)
             return
 
+        if path == "/tasks":
+            self.handle_task_list()
+            return
+
         self.send_json(404, {"error": "not_found"})
 
     def do_POST(self) -> None:
@@ -116,11 +127,15 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
 
         # /health 和 /status 是已知只读接口。
         # 使用错误方法访问时应返回 405，而不是伪装成不存在。
-        if path in {"/health", "/status"}:
+        if path in {"/health", "/status", "/sessions", "/logs", "/tasks"}:
             self.send_json(
                 405,
                 {"error": "method_not_allowed"},
             )
+            return
+
+        if path == REMINDER_TASK_PATH:
+            self.handle_create_reminder()
             return
 
         matched_path = SESSION_MESSAGE_PATH_PATTERN.fullmatch(
@@ -168,6 +183,86 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
                 "compressed_message_count": str(
                     result.compressed_message_count
                 ),
+            },
+        )
+
+    def handle_task_list(self) -> None:
+        """返回任务元数据，绝不返回提醒正文或投递聊天标识。"""
+        if self.server.reminder_service is None:
+            self.send_json(
+                503,
+                {"error": "task_service_unavailable"},
+            )
+            return
+
+        try:
+            tasks = self.server.reminder_service.list_tasks()
+        except StateStoreError as error:
+            logger.warning(
+                "Gateway 任务列表读取失败: error_type=%s",
+                type(error).__name__,
+            )
+            self.send_json(
+                500,
+                {"error": "task_list_unavailable"},
+            )
+            return
+
+        self.send_json(
+            200,
+            {
+                "tasks": [
+                    {
+                        "task_id": task.task_id,
+                        "session_id": task.session_id,
+                        "task_type": task.task_type,
+                        "status": task.status,
+                        "due_at": task.due_at,
+                        "updated_at": task.updated_at,
+                    }
+                    for task in tasks
+                ]
+            },
+        )
+
+    def handle_create_reminder(self) -> None:
+        """经 Gateway 创建持久提醒，渠道进程不再自行持有定时器。"""
+        if self.server.reminder_service is None:
+            self.send_json(
+                503,
+                {"error": "task_service_unavailable"},
+            )
+            return
+
+        payload = self.read_reminder_payload()
+
+        if payload is None:
+            return
+
+        try:
+            result = self.server.reminder_service.create_reminder(
+                session_id=payload["session_id"],
+                delay_seconds=payload["delay_seconds"],
+                content=payload["content"],
+                delivery=payload["delivery"],
+            )
+        except (ReminderTaskError, StateStoreError) as error:
+            logger.warning(
+                "Gateway 提醒创建失败: error_type=%s",
+                type(error).__name__,
+            )
+            self.send_json(
+                400,
+                {"error": "invalid_reminder_request"},
+            )
+            return
+
+        self.send_json(
+            201,
+            {
+                "task_id": result.task_id,
+                "due_at": result.due_at,
+                "status": result.status,
             },
         )
 
@@ -273,8 +368,8 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
 
         return limit
 
-    def read_message_text(self) -> str | None:
-        """读取并严格校验 JSON 请求体，不回显用户输入。"""
+    def read_json_payload(self) -> dict[str, object] | None:
+        """读取 JSON 对象请求体，通用边界检查不回显用户输入。"""
         content_type = self.headers.get(
             "Content-Type",
             "",
@@ -332,11 +427,23 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
             )
             return None
 
-        if (
-            not isinstance(payload, dict)
-            or set(payload) != {"text"}
-            or not isinstance(payload["text"], str)
-        ):
+        if not isinstance(payload, dict):
+            self.send_json(
+                400,
+                {"error": "invalid_json_payload"},
+            )
+            return None
+
+        return payload
+
+    def read_message_text(self) -> str | None:
+        """读取并严格校验会话消息 JSON，不回显用户输入。"""
+        payload = self.read_json_payload()
+
+        if payload is None:
+            return None
+
+        if set(payload) != {"text"} or not isinstance(payload["text"], str):
             self.send_json(
                 400,
                 {"error": "invalid_message_payload"},
@@ -360,6 +467,36 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
             return None
 
         return text
+
+    def read_reminder_payload(self) -> dict[str, object] | None:
+        """严格限制提醒创建参数，避免任意任务类型进入调度器。"""
+        payload = self.read_json_payload()
+
+        if payload is None:
+            return None
+
+        required_fields = {
+            "session_id",
+            "delay_seconds",
+            "content",
+            "delivery",
+        }
+
+        if (
+            set(payload) != required_fields
+            or not isinstance(payload["session_id"], str)
+            or not isinstance(payload["delay_seconds"], int)
+            or isinstance(payload["delay_seconds"], bool)
+            or not isinstance(payload["content"], str)
+            or not isinstance(payload["delivery"], dict)
+        ):
+            self.send_json(
+                400,
+                {"error": "invalid_reminder_payload"},
+            )
+            return None
+
+        return payload
 
     def is_authorized(self) -> bool:
         """在任何路由处理前校验 Token。"""
@@ -413,7 +550,14 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
 
         if SESSION_MESSAGE_PATH_PATTERN.fullmatch(path):
             route = "session_message"
-        elif path in {"/health", "/status", "/sessions", "/logs"}:
+        elif path in {
+            "/health",
+            "/status",
+            "/sessions",
+            "/logs",
+            "/tasks",
+            REMINDER_TASK_PATH,
+        }:
             route = path
         else:
             route = "unknown"
@@ -429,6 +573,7 @@ def sanitize_gateway_log_line(line: str) -> str | None:
     """只保留允许展示的 Gateway 事件类别，不保留动态参数。"""
     server_marker = " - gateway_server - "
     runtime_marker = " - gateway_agent_runtime - "
+    reminder_marker = " - persistent_reminder_service - "
 
     if server_marker in line:
         prefix, _, event = line.partition(server_marker)
@@ -451,6 +596,12 @@ def sanitize_gateway_log_line(line: str) -> str | None:
                 "Gateway 消息处理失败"
             )
 
+        if event.startswith("Gateway 提醒创建失败:"):
+            return (
+                f"{prefix}{server_marker}"
+                "Gateway 提醒创建失败"
+            )
+
     if runtime_marker in line:
         prefix, _, event = line.partition(runtime_marker)
         allowed_prefixes = (
@@ -465,6 +616,25 @@ def sanitize_gateway_log_line(line: str) -> str | None:
             return (
                 f"{prefix}{runtime_marker}"
                 "Gateway Agent 运行事件"
+            )
+
+    if reminder_marker in line:
+        prefix, _, event = line.partition(reminder_marker)
+        allowed_prefixes = (
+            "Gateway 提醒任务已创建:",
+            "Gateway 提醒任务扫描失败:",
+            "Gateway 提醒任务发送失败:",
+            "Gateway 提醒任务异常:",
+            "Gateway 提醒任务状态更新失败:",
+            "Gateway 提醒任务已发送",
+            "Gateway 提醒调度器已启动",
+            "Gateway 提醒调度器已停止",
+        )
+
+        if event.startswith(allowed_prefixes):
+            return (
+                f"{prefix}{reminder_marker}"
+                "Gateway 提醒任务事件"
             )
 
     return None
@@ -511,6 +681,7 @@ def create_gateway_server(
     config: GatewayConfig,
     agent_runtime: GatewayAgentRuntime | None = None,
     log_file: Path = LOG_FILE,
+    reminder_service: PersistentReminderService | None = None,
 ) -> GatewayHTTPServer:
     """创建仅绑定回环地址的 Gateway 服务实例。"""
     if config.host != "127.0.0.1":
@@ -529,6 +700,7 @@ def create_gateway_server(
             config,
             agent_runtime,
             log_file,
+            reminder_service,
         )
     except OSError as error:
         logger.error(
@@ -545,8 +717,11 @@ def serve_gateway(
 ) -> None:
     """初始化专用运行器后，以前台方式运行 Gateway。"""
     try:
-        agent_runtime = GatewayAgentRuntime(
-            SQLiteStateStore()
+        state_store = SQLiteStateStore()
+        agent_runtime = GatewayAgentRuntime(state_store)
+        reminder_service = PersistentReminderService(
+            state_store,
+            load_reminder_config(),
         )
     except (FileNotFoundError, ValueError) as error:
         logger.error(
@@ -557,7 +732,11 @@ def serve_gateway(
             "无法初始化 Gateway Agent 运行器。"
         ) from error
 
-    server = create_gateway_server(config, agent_runtime)
+    server = create_gateway_server(
+        config,
+        agent_runtime,
+        reminder_service=reminder_service,
+    )
 
     logger.info(
         "Gateway 启动: host=%s port=%d",
@@ -570,7 +749,9 @@ def serve_gateway(
     )
 
     try:
+        reminder_service.start()
         server.serve_forever(poll_interval=0.5)
     finally:
+        reminder_service.stop()
         server.server_close()
         logger.info("Gateway 已停止")

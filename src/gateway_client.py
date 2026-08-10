@@ -49,6 +49,27 @@ class GatewayLogResult:
     events: list[str]
 
 
+@dataclass(frozen=True)
+class GatewayReminderResult:
+    """保存 Gateway 已创建提醒的安全元数据。"""
+
+    task_id: str
+    due_at: str
+    status: str
+
+
+@dataclass(frozen=True)
+class GatewayTaskInfo:
+    """保存任务列表元数据，不含提醒正文或投递地址。"""
+
+    task_id: str
+    session_id: str
+    task_type: str
+    status: str
+    due_at: str
+    updated_at: str
+
+
 def request_gateway_json(request: Request) -> object:
     """发送本机请求并读取 JSON，不回显 Token 或请求正文。"""
     try:
@@ -192,6 +213,56 @@ def send_gateway_message(
     )
 
 
+def create_gateway_reminder(
+    config: GatewayConfig,
+    session_id: str,
+    delay_seconds: int,
+    content: str,
+    delivery: dict[str, str],
+) -> GatewayReminderResult:
+    """只经 Gateway 创建提醒，客户端不创建本地定时器。"""
+    body = json.dumps(
+        {
+            "session_id": session_id,
+            "delay_seconds": delay_seconds,
+            "content": content,
+            "delivery": delivery,
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+    request = Request(
+        f"http://{config.host}:{config.port}/tasks/reminders",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {config.token}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    payload = request_gateway_json(request)
+
+    required_fields = ("task_id", "due_at", "status")
+
+    if (
+        not isinstance(payload, dict)
+        or any(
+            not isinstance(payload.get(field), str)
+            for field in required_fields
+        )
+        or payload["status"] != "pending"
+    ):
+        raise GatewayClientError(
+            "Gateway 返回了无效提醒数据。"
+        )
+
+    return GatewayReminderResult(
+        task_id=payload["task_id"],
+        due_at=payload["due_at"],
+        status=payload["status"],
+    )
+
+
 def list_gateway_sessions(
     config: GatewayConfig,
 ) -> list[GatewaySessionInfo]:
@@ -271,3 +342,60 @@ def get_gateway_logs(
         )
 
     return GatewayLogResult(events=payload["events"])
+
+
+def list_gateway_tasks(
+    config: GatewayConfig,
+) -> list[GatewayTaskInfo]:
+    """通过 Gateway 读取任务元数据，不直接访问 SQLite。"""
+    request = Request(
+        f"http://{config.host}:{config.port}/tasks",
+        headers={
+            "Authorization": f"Bearer {config.token}",
+        },
+        method="GET",
+    )
+    payload = request_gateway_json(request)
+
+    if (
+        not isinstance(payload, dict)
+        or not isinstance(payload.get("tasks"), list)
+    ):
+        raise GatewayClientError(
+            "Gateway 返回了无效任务数据。"
+        )
+
+    tasks: list[GatewayTaskInfo] = []
+    required_fields = (
+        "task_id",
+        "session_id",
+        "task_type",
+        "status",
+        "due_at",
+        "updated_at",
+    )
+
+    for item in payload["tasks"]:
+        if (
+            not isinstance(item, dict)
+            or any(
+                not isinstance(item.get(field), str)
+                for field in required_fields
+            )
+        ):
+            raise GatewayClientError(
+                "Gateway 返回了无效任务数据。"
+            )
+
+        tasks.append(
+            GatewayTaskInfo(
+                task_id=item["task_id"],
+                session_id=item["session_id"],
+                task_type=item["task_type"],
+                status=item["status"],
+                due_at=item["due_at"],
+                updated_at=item["updated_at"],
+            )
+        )
+
+    return tasks

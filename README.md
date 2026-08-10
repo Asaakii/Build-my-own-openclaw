@@ -18,13 +18,14 @@
   - 本地 Skills 加载。
 - 通过 `daily-review` Skill 生成结构化每日复盘。
 - 通过本机 Gateway 统一处理 CLI 与 Telegram 的会话、模型和工具请求。
-- 使用 pytest 覆盖关键安全边界；当前共有 58 项自动化测试。
+- 通过 Gateway 创建可跨正常重启恢复的 Telegram 定时提醒。
+- 使用 pytest 覆盖关键安全边界；当前共有 71 项自动化测试。
 
 ## 当前限制
 
 - 仅支持一个 Telegram 白名单用户的私聊文字消息。
 - Telegram 渠道必须依赖本机 Gateway；Gateway 未运行时不会退回为直接模型调用。
-- 当前提醒功能正在迁移为持久化 Gateway 任务，暂不支持从 Telegram 创建提醒。
+- 提醒在发送前会进入 `delivering` 状态；若进程在外部发送的临界时刻异常终止，系统不会自动重试，优先避免重复提醒而非承诺严格的“恰好一次”投递。
 - 不支持图片、语音、群聊和其他消息渠道。
 - Skills 目前通过说明文本约束工具使用，尚未实现按 Skill 的代码级工具权限隔离。
 - 天气结果来自 Open-Meteo 的模型数据，不等同于现实世界的实时实测数据。
@@ -64,10 +65,10 @@ python3.12 -m venv .venv
 source .venv/bin/activate
 ```
 
-安装项目依赖：
+以开发模式安装项目和测试依赖：
 
 ```bash
-python -m pip install -r requirements.txt
+python -m pip install -e ".[dev]"
 ```
 
 复制配置模板：
@@ -156,9 +157,12 @@ myclaw gateway status
 myclaw chat "请只回复：Gateway 已连接。"
 myclaw sessions list
 myclaw logs --limit 20
+myclaw remind 10 定时提醒验证
+myclaw tasks list
 ```
 
 CLI 只通过本机 Gateway 请求服务，不会直接读取会话数据库、日志或启动第二个 Agent。
+`myclaw remind` 会使用已配置 Telegram 白名单用户作为投递目标；必须保持 Gateway 运行，才能创建或投递提醒。
 
 ## 配置并运行 Telegram Agent
 
@@ -186,7 +190,7 @@ CLI 只通过本机 Gateway 请求服务，不会直接读取会话数据库、�
 
 8. 在 Telegram 私聊中发送文字消息。
 
-用 `Ctrl+C` 停止 Telegram 渠道。Telegram 中的 `/quit` 和 `/exit` 不会停止服务，只会提示继续聊天。当前 `/remind` 正在迁移到 Gateway 持久化任务，在该迁移完成前不会作为 Telegram 本地功能执行。
+用 `Ctrl+C` 停止 Telegram 渠道。Telegram 中的 `/quit` 和 `/exit` 不会停止服务，只会提示继续聊天。可以发送 `/remind 10 定时提醒验证` 创建提醒；Telegram 只负责把命令转交 Gateway，真正的任务保存、扫描与发送都由 Gateway 完成。
 
 ## 运行测试
 
@@ -199,7 +203,7 @@ python -m pytest -q
 当前预期结果：
 
 ```text
-58 passed
+71 passed
 ```
 
 测试覆盖：
@@ -212,7 +216,8 @@ python -m pytest -q
 - Gateway 会话消息、会话列表与脱敏日志接口；
 - CLI 只能通过 Gateway 请求服务；
 - Telegram 到 Gateway 的稳定会话映射与服务不可用处理；
-- 提醒命令解析与无效参数拒绝。
+- Gateway 持久提醒的状态机、重启恢复、发送失败和资源上限；
+- 提醒任务 API、CLI 与 Telegram 创建入口，以及提醒正文脱敏。
 
 测试会使用临时目录和临时环境变量，不读取真实会话、笔记或私密配置。
 
@@ -224,6 +229,8 @@ python -m pytest -q
 - 长期记忆必须由 `/remember` 明确授权，普通聊天内容不会自动保存。
 - Telegram 仅允许配置中的单一用户从私聊进入 Agent；群聊和其他用户不会进入模型。
 - Telegram 不直接创建 Agent、读取会话或调度提醒；文字消息只能转发到带 Token 的本机 Gateway。
+- 提醒任务只允许投递到已配置的单用户 Telegram 私聊；任务列表、日志和 CLI 输出不包含提醒正文或投递地址。
+- Telegram API 未提供可用于本项目的幂等投递键，因此系统在发送前记录 `delivering`，异常中断后不自动重发；这是避免重复外部消息的明确取舍，不是严格的“恰好一次”保证。
 - 工具调用次数有限制，未知工具会被拒绝。
 
 如果 Key 或 Token 意外泄露，应立即在对应服务中撤销或重新生成，而不是只删除 Git 历史中的文本。

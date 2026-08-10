@@ -1,8 +1,10 @@
 import pytest
 
 from myclaw import cli
-from config import GatewayConfig
+from config import GatewayConfig, TelegramConfig
 from gateway_client import (
+    GatewayReminderResult,
+    GatewayTaskInfo,
     GatewayClientError,
     GatewayLogResult,
     GatewayStatus,
@@ -316,3 +318,97 @@ def test_logs_uses_gateway_client(
     assert received_arguments == [(config, 3)]
     assert "Gateway HTTP 请求完成" in output
     assert "test-token" not in output
+
+
+def test_remind_creates_gateway_task_for_allowed_telegram_user(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """remind 命令只能调用 Gateway，不直接发送或调度提醒。"""
+    gateway_config = GatewayConfig(
+        host="127.0.0.1",
+        port=18790,
+        token="test-token-with-at-least-thirty-two-characters",
+    )
+    received_arguments: list[tuple[object, ...]] = []
+
+    monkeypatch.setattr(
+        cli,
+        "load_gateway_config",
+        lambda: gateway_config,
+    )
+    monkeypatch.setattr(
+        cli,
+        "load_telegram_config",
+        lambda: TelegramConfig(
+            bot_token="not-a-real-token",
+            request_timeout_seconds=30,
+            poll_timeout_seconds=20,
+            allowed_user_id=123,
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "create_gateway_reminder",
+        lambda *arguments: (
+            received_arguments.append(arguments)
+            or GatewayReminderResult(
+                task_id="task-test",
+                due_at="2026-03-07T00:00:10+00:00",
+                status="pending",
+            )
+        ),
+    )
+
+    exit_code = cli.main(["remind", "10", "定时提醒验证"])
+
+    assert exit_code == 0
+    assert received_arguments == [
+        (
+            gateway_config,
+            "telegram:123",
+            10,
+            "定时提醒验证",
+            {"channel": "telegram", "conversation_id": "123"},
+        )
+    ]
+    assert "提醒已创建，将在 10 秒后发送。" in capsys.readouterr().out
+
+
+def test_tasks_list_hides_task_payload(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """tasks list 只展示状态，不显示提醒正文或投递地址。"""
+    monkeypatch.setattr(
+        cli,
+        "load_gateway_config",
+        lambda: GatewayConfig(
+            host="127.0.0.1",
+            port=18790,
+            token="test-token-with-at-least-thirty-two-characters",
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "list_gateway_tasks",
+        lambda _config: [
+            GatewayTaskInfo(
+                task_id="task-test",
+                session_id="telegram:123",
+                task_type="reminder",
+                status="pending",
+                due_at="2026-03-07T00:00:10+00:00",
+                updated_at="2026-03-07T00:00:00+00:00",
+            )
+        ],
+    )
+
+    exit_code = cli.main(["tasks", "list"])
+
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert "类型: reminder" in output
+    assert "状态: pending" in output
+    assert "telegram:123" not in output
+    assert "提醒验证" not in output

@@ -70,6 +70,9 @@ CREATE TABLE IF NOT EXISTS tasks (
         REFERENCES sessions(session_id)
         ON DELETE CASCADE
 );
+
+CREATE INDEX IF NOT EXISTS tasks_status_due_at
+ON tasks(status, due_at);
 """
 
 
@@ -94,6 +97,40 @@ class SessionInfo:
     message_count: int
     has_summary: bool
     updated_at: str
+
+
+@dataclass(frozen=True)
+class StoredTask:
+    """保存 Gateway 调度所需的任务数据，包含内部 payload。"""
+
+    task_id: str
+    session_id: str
+    task_type: str
+    status: str
+    payload: dict[str, object]
+    due_at: str
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class TaskInfo:
+    """保存可安全展示的任务元数据，不包含提醒正文或投递地址。"""
+
+    task_id: str
+    session_id: str
+    task_type: str
+    status: str
+    due_at: str
+    updated_at: str
+
+
+TASK_STATUSES = {
+    "pending",
+    "delivering",
+    "delivered",
+    "failed",
+}
 
 
 def utc_now() -> str:
@@ -497,6 +534,301 @@ class SQLiteStateStore:
             )
             for row in rows
         ]
+
+    def create_task(
+        self,
+        task_id: str,
+        session_id: str,
+        task_type: str,
+        payload: dict[str, object],
+        due_at: str,
+    ) -> TaskInfo:
+        """原子保存待执行任务，并为任务所属会话建立元数据。"""
+        normalized_session_id = validate_session_id(session_id)
+
+        if (
+            not isinstance(task_id, str)
+            or not task_id
+            or not isinstance(task_type, str)
+            or not task_type
+            or not isinstance(payload, dict)
+            or not isinstance(due_at, str)
+            or not due_at.strip()
+        ):
+            raise StateStoreError("任务数据无效")
+
+        try:
+            payload_json = json.dumps(
+                payload,
+                ensure_ascii=False,
+            )
+        except TypeError as error:
+            raise StateStoreError("任务数据无法序列化") from error
+
+        self.initialize()
+        timestamp = utc_now()
+
+        try:
+            with self.connection() as connection:
+                self.touch_session(
+                    connection,
+                    normalized_session_id,
+                    timestamp,
+                )
+                connection.execute(
+                    """
+                    INSERT INTO tasks (
+                        task_id,
+                        session_id,
+                        task_type,
+                        status,
+                        payload_json,
+                        due_at,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        task_id,
+                        normalized_session_id,
+                        task_type,
+                        "pending",
+                        payload_json,
+                        due_at,
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+        except (OSError, sqlite3.Error) as error:
+            logger.error(
+                "创建 SQLite 任务失败: error_type=%s",
+                type(error).__name__,
+            )
+            raise StateStoreError("无法创建任务") from error
+
+        return TaskInfo(
+            task_id=task_id,
+            session_id=normalized_session_id,
+            task_type=task_type,
+            status="pending",
+            due_at=due_at,
+            updated_at=timestamp,
+        )
+
+    def decode_task_row(
+        self,
+        row: sqlite3.Row,
+    ) -> StoredTask | None:
+        """解析任务 payload；损坏任务不交给调度器执行。"""
+        try:
+            payload = json.loads(row["payload_json"])
+        except json.JSONDecodeError:
+            logger.warning("跳过损坏的 SQLite 任务记录")
+            return None
+
+        if not isinstance(payload, dict):
+            logger.warning("跳过结构无效的 SQLite 任务记录")
+            return None
+
+        due_at = row["due_at"]
+
+        if not isinstance(due_at, str) or not due_at:
+            logger.warning("跳过缺少到期时间的 SQLite 任务记录")
+            return None
+
+        return StoredTask(
+            task_id=row["task_id"],
+            session_id=row["session_id"],
+            task_type=row["task_type"],
+            status=row["status"],
+            payload=payload,
+            due_at=due_at,
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    def list_tasks(self) -> list[TaskInfo]:
+        """返回任务元数据，不读取或暴露提醒正文和投递地址。"""
+        self.initialize()
+
+        try:
+            with self.connection() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT
+                        task_id,
+                        session_id,
+                        task_type,
+                        status,
+                        due_at,
+                        updated_at
+                    FROM tasks
+                    ORDER BY due_at ASC, created_at ASC
+                    """
+                ).fetchall()
+        except (OSError, sqlite3.Error) as error:
+            logger.error(
+                "列出 SQLite 任务失败: error_type=%s",
+                type(error).__name__,
+            )
+            raise StateStoreError("无法列出任务") from error
+
+        return [
+            TaskInfo(
+                task_id=row["task_id"],
+                session_id=row["session_id"],
+                task_type=row["task_type"],
+                status=row["status"],
+                due_at=row["due_at"],
+                updated_at=row["updated_at"],
+            )
+            for row in rows
+        ]
+
+    def count_tasks_with_status(
+        self,
+        statuses: set[str],
+    ) -> int:
+        """统计未终结任务，用于限制同时等待或发送的提醒数量。"""
+        if not statuses or not statuses.issubset(TASK_STATUSES):
+            raise StateStoreError("任务状态无效")
+
+        self.initialize()
+        placeholders = ", ".join("?" for _ in statuses)
+
+        try:
+            with self.connection() as connection:
+                row = connection.execute(
+                    f"""
+                    SELECT COUNT(*) AS task_count
+                    FROM tasks
+                    WHERE status IN ({placeholders})
+                    """,
+                    tuple(sorted(statuses)),
+                ).fetchone()
+        except (OSError, sqlite3.Error) as error:
+            logger.error(
+                "统计 SQLite 任务失败: error_type=%s",
+                type(error).__name__,
+            )
+            raise StateStoreError("无法统计任务") from error
+
+        return int(row["task_count"])
+
+    def claim_due_tasks(
+        self,
+        task_type: str,
+        due_before: str,
+        limit: int,
+    ) -> list[StoredTask]:
+        """将到期任务原子改为发送中，避免重复调度同一任务。"""
+        if (
+            not isinstance(task_type, str)
+            or not task_type
+            or not isinstance(due_before, str)
+            or not due_before
+            or not isinstance(limit, int)
+            or not 1 <= limit <= 100
+        ):
+            raise StateStoreError("领取任务参数无效")
+
+        self.initialize()
+        timestamp = utc_now()
+        claimed_tasks: list[StoredTask] = []
+
+        try:
+            with self.connection() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT *
+                    FROM tasks
+                    WHERE task_type = ?
+                        AND status = 'pending'
+                        AND due_at <= ?
+                    ORDER BY due_at ASC, created_at ASC
+                    LIMIT ?
+                    """,
+                    (task_type, due_before, limit),
+                ).fetchall()
+
+                for row in rows:
+                    updated = connection.execute(
+                        """
+                        UPDATE tasks
+                        SET status = 'delivering', updated_at = ?
+                        WHERE task_id = ? AND status = 'pending'
+                        """,
+                        (timestamp, row["task_id"]),
+                    )
+
+                    if updated.rowcount != 1:
+                        continue
+
+                    task = self.decode_task_row(row)
+
+                    if task is None:
+                        connection.execute(
+                            """
+                            UPDATE tasks
+                            SET status = 'failed', updated_at = ?
+                            WHERE task_id = ?
+                            """,
+                            (timestamp, row["task_id"]),
+                        )
+                        continue
+
+                    claimed_tasks.append(
+                        StoredTask(
+                            task_id=task.task_id,
+                            session_id=task.session_id,
+                            task_type=task.task_type,
+                            status="delivering",
+                            payload=task.payload,
+                            due_at=task.due_at,
+                            created_at=task.created_at,
+                            updated_at=timestamp,
+                        )
+                    )
+        except (OSError, sqlite3.Error) as error:
+            logger.error(
+                "领取 SQLite 到期任务失败: error_type=%s",
+                type(error).__name__,
+            )
+            raise StateStoreError("无法领取到期任务") from error
+
+        return claimed_tasks
+
+    def complete_claimed_task(
+        self,
+        task_id: str,
+        status: str,
+    ) -> None:
+        """结束发送中的任务，拒绝跳过状态机直接更新。"""
+        if status not in {"delivered", "failed"}:
+            raise StateStoreError("任务终结状态无效")
+
+        self.initialize()
+
+        try:
+            with self.connection() as connection:
+                updated = connection.execute(
+                    """
+                    UPDATE tasks
+                    SET status = ?, updated_at = ?
+                    WHERE task_id = ? AND status = 'delivering'
+                    """,
+                    (status, utc_now(), task_id),
+                )
+        except (OSError, sqlite3.Error) as error:
+            logger.error(
+                "更新 SQLite 任务状态失败: error_type=%s",
+                type(error).__name__,
+            )
+            raise StateStoreError("无法更新任务状态") from error
+
+        if updated.rowcount != 1:
+            raise StateStoreError("任务状态已变化，拒绝重复更新")
 
     def session_exists(self, session_id: str) -> bool:
         """确认目标会话是否已经存在，迁移时用来拒绝重复导入。"""

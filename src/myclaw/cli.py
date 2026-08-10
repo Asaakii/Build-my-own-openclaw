@@ -5,12 +5,15 @@ from importlib.metadata import PackageNotFoundError, version
 from config import (
     describe_model_config,
     load_gateway_config,
+    load_telegram_config,
 )
 from gateway_client import (
+    create_gateway_reminder,
     GatewayClientError,
     get_gateway_logs,
     get_gateway_status,
     GatewayMessageResult,
+    list_gateway_tasks,
     list_gateway_sessions,
     send_gateway_message,
 )
@@ -121,6 +124,39 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=20,
         help="返回的日志事件数量，范围由 Gateway 限制。",
+    )
+
+    remind_parser = subparsers.add_parser(
+        "remind",
+        help="通过 Gateway 创建一条 Telegram 定时提醒。",
+    )
+    remind_parser.add_argument(
+        "delay_seconds",
+        type=int,
+        help="延迟秒数，必须大于 0。",
+    )
+    remind_parser.add_argument(
+        "content",
+        help="提醒正文。",
+    )
+    remind_parser.add_argument(
+        "--session-id",
+        default=None,
+        help="可选会话标识；默认使用当前 Telegram 用户的会话。",
+    )
+
+    tasks_parser = subparsers.add_parser(
+        "tasks",
+        help="通过 Gateway 查看任务元数据。",
+    )
+    tasks_subparsers = tasks_parser.add_subparsers(
+        dest="tasks_command",
+        required=True,
+        metavar="TASKS_COMMAND",
+    )
+    tasks_subparsers.add_parser(
+        "list",
+        help="列出任务，不显示提醒正文或投递地址。",
     )
 
     return parser
@@ -258,6 +294,65 @@ def run_logs(limit: int) -> int:
     return 0
 
 
+def run_remind(
+    delay_seconds: int,
+    content: str,
+    session_id: str | None,
+) -> int:
+    """由 CLI 请求 Gateway 保存提醒；不会在本地启动定时器。"""
+    try:
+        gateway_config = load_gateway_config()
+        telegram_config = load_telegram_config()
+        stable_session_id = session_id or (
+            f"telegram:{telegram_config.allowed_user_id}"
+        )
+        create_gateway_reminder(
+            gateway_config,
+            stable_session_id,
+            delay_seconds,
+            content,
+            {
+                "channel": "telegram",
+                "conversation_id": str(
+                    telegram_config.allowed_user_id
+                ),
+            },
+        )
+    except (ValueError, GatewayClientError) as error:
+        print(f"提醒创建失败: {error}")
+        return 1
+
+    print(f"提醒已创建，将在 {delay_seconds} 秒后发送。")
+    return 0
+
+
+def run_tasks_list() -> int:
+    """通过 Gateway 列出任务，只展示调度元数据。"""
+    try:
+        config = load_gateway_config()
+        tasks = list_gateway_tasks(config)
+    except (ValueError, GatewayClientError) as error:
+        print(f"任务列表查询失败: {error}")
+        return 1
+
+    if not tasks:
+        print("暂无可用任务。")
+        return 0
+
+    print("任务列表：")
+
+    for task in tasks:
+        print(
+            "- "
+            f"类型: {task.task_type}"
+            f" | 状态: {task.status}"
+            f" | 到期时间: {task.due_at}"
+            f" | 更新时间: {task.updated_at}"
+        )
+
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """解析 CLI 参数，并执行当前已经支持的最小命令集。"""
     parser = build_parser()
@@ -297,6 +392,19 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if arguments.command == "logs":
         return run_logs(arguments.limit)
+
+    if arguments.command == "remind":
+        return run_remind(
+            arguments.delay_seconds,
+            arguments.content,
+            arguments.session_id,
+        )
+
+    if (
+        arguments.command == "tasks"
+        and arguments.tasks_command == "list"
+    ):
+        return run_tasks_list()
 
     # 目前理论上不会到这里；保留此分支便于未来增加命令时安全失败。
     parser.error("不支持的命令")

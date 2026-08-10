@@ -1,6 +1,13 @@
 from channel import IncomingMessage, OutgoingMessage
 from config import GatewayConfig
-from gateway_client import send_gateway_message
+from gateway_client import (
+    create_gateway_reminder,
+    send_gateway_message,
+)
+from reminder_scheduler import (
+    ReminderCommandError,
+    parse_reminder_command,
+)
 
 
 TELEGRAM_CHANNEL_NAME = "telegram"
@@ -37,6 +44,38 @@ def forward_telegram_message(
     session_id = build_telegram_session_id(
         incoming_message.conversation_id
     )
+
+    try:
+        reminder_request = parse_reminder_command(
+            incoming_message.text
+        )
+    except ReminderCommandError as error:
+        # 只解析命令格式；定时器和任务数据均由 Gateway 管理。
+        return OutgoingMessage(
+            conversation_id=incoming_message.conversation_id,
+            text=f"提醒命令错误：{error}",
+            is_reply=True,
+        )
+
+    if reminder_request is not None:
+        create_gateway_reminder(
+            gateway_config,
+            session_id,
+            reminder_request.delay_seconds,
+            reminder_request.content,
+            {
+                "channel": TELEGRAM_CHANNEL_NAME,
+                "conversation_id": incoming_message.conversation_id,
+            },
+        )
+        return OutgoingMessage(
+            conversation_id=incoming_message.conversation_id,
+            text=(
+                "提醒已创建，将在 "
+                f"{reminder_request.delay_seconds} 秒后发送。"
+            ),
+            is_reply=True,
+        )
 
     # Telegram 不创建 Agent、不读取 SQLite，只请求 Gateway。
     result = send_gateway_message(

@@ -9,8 +9,12 @@ import gateway_client
 from config import GatewayConfig
 from gateway_agent_runtime import GatewayAgentResult
 from gateway_client import (
+    create_gateway_reminder,
     GatewayClientError,
     GatewayLogResult,
+    GatewayReminderResult,
+    GatewayTaskInfo,
+    list_gateway_tasks,
     list_gateway_sessions,
     send_gateway_message,
     get_gateway_logs,
@@ -201,3 +205,86 @@ def test_client_reads_only_gateway_log_events(
     assert result == GatewayLogResult(
         events=["Gateway HTTP 请求完成"]
     )
+
+
+def test_client_creates_reminder_through_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """提醒客户端只构造 Gateway 请求，不拥有本地定时器。"""
+    captured_requests = []
+
+    def return_reminder(request):
+        captured_requests.append(request)
+        return {
+            "task_id": "task-test",
+            "due_at": "2026-03-07T00:00:10+00:00",
+            "status": "pending",
+        }
+
+    monkeypatch.setattr(
+        gateway_client,
+        "request_gateway_json",
+        return_reminder,
+    )
+
+    result = create_gateway_reminder(
+        GatewayConfig(
+            host="127.0.0.1",
+            port=18790,
+            token=TEST_TOKEN,
+        ),
+        "telegram:123",
+        10,
+        "提醒验证",
+        {"channel": "telegram", "conversation_id": "123"},
+    )
+
+    assert result == GatewayReminderResult(
+        task_id="task-test",
+        due_at="2026-03-07T00:00:10+00:00",
+        status="pending",
+    )
+    assert captured_requests[0].full_url.endswith(
+        "/tasks/reminders"
+    )
+
+
+def test_client_reads_task_metadata_without_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """任务列表客户端只能接受 Gateway 返回的安全元数据。"""
+    monkeypatch.setattr(
+        gateway_client,
+        "request_gateway_json",
+        lambda _request: {
+            "tasks": [
+                {
+                    "task_id": "task-test",
+                    "session_id": "telegram:123",
+                    "task_type": "reminder",
+                    "status": "pending",
+                    "due_at": "2026-03-07T00:00:10+00:00",
+                    "updated_at": "2026-03-07T00:00:00+00:00",
+                }
+            ]
+        },
+    )
+
+    tasks = list_gateway_tasks(
+        GatewayConfig(
+            host="127.0.0.1",
+            port=18790,
+            token=TEST_TOKEN,
+        )
+    )
+
+    assert tasks == [
+        GatewayTaskInfo(
+            task_id="task-test",
+            session_id="telegram:123",
+            task_type="reminder",
+            status="pending",
+            due_at="2026-03-07T00:00:10+00:00",
+            updated_at="2026-03-07T00:00:00+00:00",
+        )
+    ]

@@ -3,7 +3,10 @@ import pytest
 import telegram_gateway_adapter
 from channel import IncomingMessage
 from config import GatewayConfig
-from gateway_client import GatewayMessageResult
+from gateway_client import (
+    GatewayMessageResult,
+    GatewayReminderResult,
+)
 from telegram_gateway_adapter import (
     build_telegram_session_id,
     forward_telegram_message,
@@ -85,3 +88,67 @@ def test_forward_telegram_message_rejects_other_channel() -> None:
             TEST_GATEWAY_CONFIG,
             make_telegram_message(channel_name="terminal"),
         )
+
+
+def test_reminder_command_is_created_only_through_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Telegram 的 /remind 只请求 Gateway，不持有进程内 Timer。"""
+    received_arguments: list[tuple[object, ...]] = []
+
+    monkeypatch.setattr(
+        telegram_gateway_adapter,
+        "create_gateway_reminder",
+        lambda *arguments: (
+            received_arguments.append(arguments)
+            or GatewayReminderResult(
+                task_id="task-test",
+                due_at="2026-03-07T00:00:10+00:00",
+                status="pending",
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        telegram_gateway_adapter,
+        "send_gateway_message",
+        lambda *_arguments: pytest.fail("/remind 不应调用 Agent"),
+    )
+    incoming = IncomingMessage(
+        channel_name="telegram",
+        conversation_id="123",
+        sender_id="123",
+        text="/remind 10 定时提醒验证",
+    )
+
+    outgoing = forward_telegram_message(
+        TEST_GATEWAY_CONFIG,
+        incoming,
+    )
+
+    assert received_arguments == [
+        (
+            TEST_GATEWAY_CONFIG,
+            "telegram:123",
+            10,
+            "定时提醒验证",
+            {"channel": "telegram", "conversation_id": "123"},
+        )
+    ]
+    assert outgoing.text == "提醒已创建，将在 10 秒后发送。"
+
+
+def test_invalid_reminder_command_returns_safe_reply() -> None:
+    """格式错误的 /remind 不进入 Gateway，也不会改走普通聊天。"""
+    incoming = IncomingMessage(
+        channel_name="telegram",
+        conversation_id="123",
+        sender_id="123",
+        text="/remind 0 无效提醒",
+    )
+
+    outgoing = forward_telegram_message(
+        TEST_GATEWAY_CONFIG,
+        incoming,
+    )
+
+    assert outgoing.text == "提醒命令错误：提醒秒数必须大于 0"
