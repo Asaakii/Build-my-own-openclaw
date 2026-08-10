@@ -32,6 +32,23 @@ class GatewayMessageResult:
     compressed_message_count: int
 
 
+@dataclass(frozen=True)
+class GatewaySessionInfo:
+    """保存 CLI 可以展示的会话元数据，不含消息正文。"""
+
+    session_id: str
+    message_count: int
+    has_summary: bool
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class GatewayLogResult:
+    """保存 Gateway 已脱敏的运行事件。"""
+
+    events: list[str]
+
+
 def request_gateway_json(request: Request) -> object:
     """发送本机请求并读取 JSON，不回显 Token 或请求正文。"""
     try:
@@ -53,12 +70,12 @@ def request_gateway_json(request: Request) -> object:
 
         if error.code == 413:
             raise GatewayClientError(
-                "消息超过 Gateway 允许范围。"
+                "请求超过 Gateway 允许范围。"
             ) from error
 
         if 400 <= error.code < 500:
             raise GatewayClientError(
-                "Gateway 拒绝了消息请求。"
+                "Gateway 拒绝了请求。"
             ) from error
 
         raise GatewayClientError(
@@ -173,3 +190,84 @@ def send_gateway_message(
         reply=payload["reply"],
         compressed_message_count=compressed_message_count,
     )
+
+
+def list_gateway_sessions(
+    config: GatewayConfig,
+) -> list[GatewaySessionInfo]:
+    """通过 Gateway 读取会话元数据，不直接访问 SQLite。"""
+    request = Request(
+        f"http://{config.host}:{config.port}/sessions",
+        headers={
+            "Authorization": f"Bearer {config.token}",
+        },
+        method="GET",
+    )
+    payload = request_gateway_json(request)
+
+    if (
+        not isinstance(payload, dict)
+        or not isinstance(payload.get("sessions"), list)
+    ):
+        raise GatewayClientError(
+            "Gateway 返回了无效会话数据。"
+        )
+
+    sessions: list[GatewaySessionInfo] = []
+
+    for item in payload["sessions"]:
+        if (
+            not isinstance(item, dict)
+            or not isinstance(item.get("session_id"), str)
+            or not isinstance(item.get("message_count"), int)
+            or isinstance(item.get("message_count"), bool)
+            or not isinstance(item.get("has_summary"), bool)
+            or not isinstance(item.get("updated_at"), str)
+            or item["message_count"] < 0
+        ):
+            raise GatewayClientError(
+                "Gateway 返回了无效会话数据。"
+            )
+
+        sessions.append(
+            GatewaySessionInfo(
+                session_id=item["session_id"],
+                message_count=item["message_count"],
+                has_summary=item["has_summary"],
+                updated_at=item["updated_at"],
+            )
+        )
+
+    return sessions
+
+
+def get_gateway_logs(
+    config: GatewayConfig,
+    limit: int,
+) -> GatewayLogResult:
+    """通过 Gateway 读取数量受限的脱敏日志事件。"""
+    request = Request(
+        (
+            f"http://{config.host}:{config.port}"
+            f"/logs?limit={limit}"
+        ),
+        headers={
+            "Authorization": f"Bearer {config.token}",
+        },
+        method="GET",
+    )
+    payload = request_gateway_json(request)
+
+    if (
+        not isinstance(payload, dict)
+        or not isinstance(payload.get("events"), list)
+        or not all(
+            isinstance(event, str)
+            for event in payload["events"]
+        )
+    ):
+        raise GatewayClientError(
+            "Gateway 返回了无效日志数据。"
+        )
+
+    return GatewayLogResult(events=payload["events"])

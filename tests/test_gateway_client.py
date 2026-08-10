@@ -10,7 +10,10 @@ from config import GatewayConfig
 from gateway_agent_runtime import GatewayAgentResult
 from gateway_client import (
     GatewayClientError,
+    GatewayLogResult,
+    list_gateway_sessions,
     send_gateway_message,
+    get_gateway_logs,
 )
 from gateway_server import create_gateway_server
 
@@ -133,3 +136,68 @@ def test_client_reports_unavailable_gateway(
             "local:client-test",
             "测试消息",
         )
+
+
+def test_client_reads_session_metadata_without_database_access(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """会话列表客户端只能解析 Gateway 返回的元数据。"""
+    captured_requests = []
+
+    def return_sessions(request):
+        captured_requests.append(request)
+        return {
+            "sessions": [
+                {
+                    "session_id": "local:client-test",
+                    "message_count": 2,
+                    "has_summary": True,
+                    "updated_at": "2026-03-07T00:00:00+00:00",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(
+        gateway_client,
+        "request_gateway_json",
+        return_sessions,
+    )
+
+    sessions = list_gateway_sessions(
+        GatewayConfig(
+            host="127.0.0.1",
+            port=18790,
+            token=TEST_TOKEN,
+        )
+    )
+
+    assert sessions[0].session_id == "local:client-test"
+    assert sessions[0].message_count == 2
+    assert sessions[0].has_summary is True
+    assert captured_requests[0].full_url.endswith("/sessions")
+
+
+def test_client_reads_only_gateway_log_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """日志客户端只接受 Gateway 已脱敏的字符串事件列表。"""
+    monkeypatch.setattr(
+        gateway_client,
+        "request_gateway_json",
+        lambda _request: {
+            "events": ["Gateway HTTP 请求完成"]
+        },
+    )
+
+    result = get_gateway_logs(
+        GatewayConfig(
+            host="127.0.0.1",
+            port=18790,
+            token=TEST_TOKEN,
+        ),
+        3,
+    )
+
+    assert result == GatewayLogResult(
+        events=["Gateway HTTP 请求完成"]
+    )

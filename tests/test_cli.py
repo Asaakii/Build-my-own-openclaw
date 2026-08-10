@@ -4,8 +4,10 @@ from myclaw import cli
 from config import GatewayConfig
 from gateway_client import (
     GatewayClientError,
+    GatewayLogResult,
     GatewayStatus,
     GatewayMessageResult,
+    GatewaySessionInfo,
 )
 
 
@@ -233,3 +235,84 @@ def test_chat_returns_safe_error_when_gateway_fails(
 
     assert exit_code == 1
     assert "消息发送失败" in capsys.readouterr().out
+
+
+def test_sessions_list_uses_gateway_client(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """会话列表命令只能委托 Gateway 客户端。"""
+    config = GatewayConfig(
+        host="127.0.0.1",
+        port=18790,
+        token="test-token-with-at-least-thirty-two-characters",
+    )
+    received_configs: list[GatewayConfig] = []
+
+    monkeypatch.setattr(
+        cli,
+        "load_gateway_config",
+        lambda: config,
+    )
+    monkeypatch.setattr(
+        cli,
+        "list_gateway_sessions",
+        lambda received_config: (
+            received_configs.append(received_config)
+            or [
+                GatewaySessionInfo(
+                    session_id="local:cli-test",
+                    message_count=2,
+                    has_summary=True,
+                    updated_at="2026-03-07T00:00:00+00:00",
+                )
+            ]
+        ),
+    )
+
+    exit_code = cli.main(["sessions", "list"])
+
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert received_configs == [config]
+    assert "local:cli-test" in output
+    assert "消息数: 2" in output
+    assert "已有摘要: 是" in output
+    assert "test-token" not in output
+
+
+def test_logs_uses_gateway_client(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """日志命令只能读取 Gateway 返回的脱敏事件。"""
+    config = GatewayConfig(
+        host="127.0.0.1",
+        port=18790,
+        token="test-token-with-at-least-thirty-two-characters",
+    )
+    received_arguments: list[tuple[GatewayConfig, int]] = []
+
+    monkeypatch.setattr(
+        cli,
+        "load_gateway_config",
+        lambda: config,
+    )
+    monkeypatch.setattr(
+        cli,
+        "get_gateway_logs",
+        lambda received_config, limit: (
+            received_arguments.append((received_config, limit))
+            or GatewayLogResult(
+                events=["Gateway HTTP 请求完成"]
+            )
+        ),
+    )
+
+    exit_code = cli.main(["logs", "--limit", "3"])
+
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert received_arguments == [(config, 3)]
+    assert "Gateway HTTP 请求完成" in output
+    assert "test-token" not in output

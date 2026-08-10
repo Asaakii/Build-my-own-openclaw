@@ -5,13 +5,16 @@ import re
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 from config import GatewayConfig
 from gateway_agent_runtime import (
     GatewayAgentError,
     GatewayAgentRuntime,
 )
-from sqlite_state_store import SQLiteStateStore
+from logging_config import LOG_FILE
+from sqlite_state_store import SQLiteStateStore, StateStoreError
 
 
 logger = logging.getLogger(__name__)
@@ -20,6 +23,9 @@ PACKAGE_NAME = "myclaw"
 
 MAX_REQUEST_BODY_BYTES = 8_000
 MAX_MESSAGE_CHARACTERS = 2_000
+DEFAULT_LOG_EVENT_LIMIT = 20
+MAX_LOG_EVENT_LIMIT = 100
+MAX_LOG_READ_BYTES = 256_000
 SESSION_MESSAGE_PATH_PATTERN = re.compile(
     r"^/sessions/([A-Za-z0-9][A-Za-z0-9:_-]{0,119})/messages$"
 )
@@ -44,6 +50,7 @@ class GatewayHTTPServer(HTTPServer):
         self,
         config: GatewayConfig,
         agent_runtime: GatewayAgentRuntime | None = None,
+        log_file: Path = LOG_FILE,
     ) -> None:
         super().__init__(
             (config.host, config.port),
@@ -51,6 +58,7 @@ class GatewayHTTPServer(HTTPServer):
         )
         self.gateway_config = config
         self.agent_runtime = agent_runtime
+        self.log_file = log_file
         self.started_at = datetime.now(
             timezone.utc
         ).isoformat()
@@ -67,7 +75,8 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
         if not self.is_authorized():
             return
 
-        path = self.path.split("?", maxsplit=1)[0]
+        request_url = urlsplit(self.path)
+        path = request_url.path
 
         if path == "/health":
             self.send_json(200, {"status": "ok"})
@@ -88,6 +97,14 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if path == "/sessions":
+            self.handle_session_list()
+            return
+
+        if path == "/logs":
+            self.handle_log_list(request_url.query)
+            return
+
         self.send_json(404, {"error": "not_found"})
 
     def do_POST(self) -> None:
@@ -95,7 +112,7 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
         if not self.is_authorized():
             return
 
-        path = self.path.split("?", maxsplit=1)[0]
+        path = urlsplit(self.path).path
 
         # /health 和 /status 是已知只读接口。
         # 使用错误方法访问时应返回 405，而不是伪装成不存在。
@@ -153,6 +170,108 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
                 ),
             },
         )
+
+    def handle_session_list(self) -> None:
+        """仅返回会话元数据，绝不读取或返回消息正文。"""
+        if self.server.agent_runtime is None:
+            self.send_json(
+                503,
+                {"error": "session_service_unavailable"},
+            )
+            return
+
+        try:
+            sessions = self.server.agent_runtime.state_store.list_sessions()
+        except StateStoreError as error:
+            logger.warning(
+                "Gateway 会话列表读取失败: error_type=%s",
+                type(error).__name__,
+            )
+            self.send_json(
+                500,
+                {"error": "session_list_unavailable"},
+            )
+            return
+
+        self.send_json(
+            200,
+            {
+                "sessions": [
+                    {
+                        "session_id": session.session_id,
+                        "message_count": session.message_count,
+                        "has_summary": session.has_summary,
+                        "updated_at": session.updated_at,
+                    }
+                    for session in sessions
+                ]
+            },
+        )
+
+    def handle_log_list(self, query: str) -> None:
+        """返回数量受限且已脱敏的 Gateway 运行事件。"""
+        limit = self.read_log_limit(query)
+
+        if limit is None:
+            return
+
+        try:
+            events = read_recent_gateway_logs(
+                self.server.log_file,
+                limit,
+            )
+        except GatewayServerError as error:
+            logger.warning(
+                "Gateway 日志读取失败: error_type=%s",
+                type(error).__name__,
+            )
+            self.send_json(
+                500,
+                {"error": "log_list_unavailable"},
+            )
+            return
+
+        self.send_json(200, {"events": events})
+
+    def read_log_limit(self, query: str) -> int | None:
+        """校验日志数量，防止一次读取过多内容。"""
+        if not query:
+            return DEFAULT_LOG_EVENT_LIMIT
+
+        parameters = parse_qs(
+            query,
+            keep_blank_values=True,
+        )
+
+        if (
+            set(parameters) != {"limit"}
+            or len(parameters["limit"]) != 1
+        ):
+            self.send_json(
+                400,
+                {"error": "invalid_log_limit"},
+            )
+            return None
+
+        raw_limit = parameters["limit"][0]
+
+        if not raw_limit.isdecimal():
+            self.send_json(
+                400,
+                {"error": "invalid_log_limit"},
+            )
+            return None
+
+        limit = int(raw_limit)
+
+        if not 1 <= limit <= MAX_LOG_EVENT_LIMIT:
+            self.send_json(
+                400,
+                {"error": "invalid_log_limit"},
+            )
+            return None
+
+        return limit
 
     def read_message_text(self) -> str | None:
         """读取并严格校验 JSON 请求体，不回显用户输入。"""
@@ -264,7 +383,7 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
     def send_json(
         self,
         status_code: int,
-        payload: dict[str, str],
+        payload: dict[str, object],
     ) -> None:
         """返回固定 JSON，不回显 Token 或请求正文。"""
         body = json.dumps(
@@ -289,18 +408,109 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
         _format: str,
         *_arguments: object,
     ) -> None:
-        """只记录方法和路径，不记录请求头或正文。"""
-        path = self.path.split("?", maxsplit=1)[0]
+        """只记录脱敏路由类别，不记录会话标识、请求头或正文。"""
+        path = urlsplit(self.path).path
+
+        if SESSION_MESSAGE_PATH_PATTERN.fullmatch(path):
+            route = "session_message"
+        elif path in {"/health", "/status", "/sessions", "/logs"}:
+            route = path
+        else:
+            route = "unknown"
+
         logger.info(
-            "Gateway HTTP 请求完成: method=%s path=%s",
+            "Gateway HTTP 请求完成: method=%s route=%s",
             self.command,
-            path,
+            route,
         )
+
+
+def sanitize_gateway_log_line(line: str) -> str | None:
+    """只保留允许展示的 Gateway 事件类别，不保留动态参数。"""
+    server_marker = " - gateway_server - "
+    runtime_marker = " - gateway_agent_runtime - "
+
+    if server_marker in line:
+        prefix, _, event = line.partition(server_marker)
+
+        if event.startswith("Gateway 启动:"):
+            return f"{prefix}{server_marker}Gateway 启动"
+
+        if event.startswith("Gateway 已停止"):
+            return f"{prefix}{server_marker}Gateway 已停止"
+
+        if event.startswith("Gateway HTTP 请求完成:"):
+            return (
+                f"{prefix}{server_marker}"
+                "Gateway HTTP 请求完成"
+            )
+
+        if event.startswith("Gateway 消息处理失败:"):
+            return (
+                f"{prefix}{server_marker}"
+                "Gateway 消息处理失败"
+            )
+
+    if runtime_marker in line:
+        prefix, _, event = line.partition(runtime_marker)
+        allowed_prefixes = (
+            "Gateway Agent 请求工具:",
+            "Gateway Agent 回合失败:",
+            "Gateway Agent 保存会话失败:",
+            "Gateway 会话压缩失败:",
+            "Gateway 压缩快照保存失败:",
+        )
+
+        if event.startswith(allowed_prefixes):
+            return (
+                f"{prefix}{runtime_marker}"
+                "Gateway Agent 运行事件"
+            )
+
+    return None
+
+
+def read_recent_gateway_logs(
+    log_file: Path,
+    limit: int,
+) -> list[str]:
+    """读取日志末尾的有限字节，并只返回脱敏后的 Gateway 事件。"""
+    if not log_file.exists():
+        return []
+
+    try:
+        with log_file.open("rb") as file:
+            file.seek(0, 2)
+            file_size = file.tell()
+            start_position = max(
+                0,
+                file_size - MAX_LOG_READ_BYTES,
+            )
+            file.seek(start_position)
+            content = file.read()
+    except OSError as error:
+        raise GatewayServerError(
+            "无法读取 Gateway 日志。"
+        ) from error
+
+    events: list[str] = []
+
+    for line in content.decode(
+        "utf-8",
+        errors="replace",
+    ).splitlines():
+        safe_line = sanitize_gateway_log_line(line)
+
+        if safe_line is not None:
+            events.append(safe_line)
+
+    return events[-limit:]
 
 
 def create_gateway_server(
     config: GatewayConfig,
     agent_runtime: GatewayAgentRuntime | None = None,
+    log_file: Path = LOG_FILE,
 ) -> GatewayHTTPServer:
     """创建仅绑定回环地址的 Gateway 服务实例。"""
     if config.host != "127.0.0.1":
@@ -315,7 +525,11 @@ def create_gateway_server(
         raise GatewayServerError("Gateway Token 无效。")
 
     try:
-        return GatewayHTTPServer(config, agent_runtime)
+        return GatewayHTTPServer(
+            config,
+            agent_runtime,
+            log_file,
+        )
     except OSError as error:
         logger.error(
             "Gateway 启动失败: error_type=%s",
