@@ -49,6 +49,7 @@ py-modules = [
     "soul",
     "telegram_api",
     "telegram_channel",
+    "telegram_gateway_adapter",
     "telegram_main",
     "telegram_setup",
     "terminal_channel",

@@ -17,14 +17,14 @@
   - 当前模型天气查询；
   - 本地 Skills 加载。
 - 通过 `daily-review` Skill 生成结构化每日复盘。
-- 通过 `/remind 秒数 内容` 创建短时 Telegram 提醒。
-- 使用 pytest 覆盖关键安全边界；当前共有 12 项自动化测试。
+- 通过本机 Gateway 统一处理 CLI 与 Telegram 的会话、模型和工具请求。
+- 使用 pytest 覆盖关键安全边界；当前共有 58 项自动化测试。
 
 ## 当前限制
 
 - 仅支持一个 Telegram 白名单用户的私聊文字消息。
-- 当前会话存储是单用户设计，不支持多用户会话隔离或并行处理。
-- Telegram 渠道使用单进程长轮询；程序停止后，未触发的提醒会被取消。
+- Telegram 渠道必须依赖本机 Gateway；Gateway 未运行时不会退回为直接模型调用。
+- 当前提醒功能正在迁移为持久化 Gateway 任务，暂不支持从 Telegram 创建提醒。
 - 不支持图片、语音、群聊和其他消息渠道。
 - Skills 目前通过说明文本约束工具使用，尚未实现按 Skill 的代码级工具权限隔离。
 - 天气结果来自 Open-Meteo 的模型数据，不等同于现实世界的实时实测数据。
@@ -95,6 +95,10 @@ TELEGRAM_ALLOWED_USER_ID=替换为自己的数字用户_ID
 
 REMINDER_MAX_DELAY_SECONDS=3600
 REMINDER_MAX_ACTIVE_TASKS=5
+
+MYCLAW_GATEWAY_HOST=127.0.0.1
+MYCLAW_GATEWAY_PORT=18790
+MYCLAW_GATEWAY_TOKEN=替换为至少32字符的本机随机Token
 ```
 
 说明：
@@ -102,7 +106,7 @@ REMINDER_MAX_ACTIVE_TASKS=5
 - 当前代码只支持 `LLM_PROVIDER=deepseek`。
 - `TELEGRAM_REQUEST_TIMEOUT_SECONDS` 必须大于 `TELEGRAM_POLL_TIMEOUT_SECONDS`。
 - `TELEGRAM_ALLOWED_USER_ID` 必须是正整数，且只允许该用户从私聊使用 Bot。
-- 提醒最长等待时间和同时运行数量均受配置限制。
+- Gateway 只允许监听 `127.0.0.1`，Token 只保存在本机 `.env` 中。
 - 模型名称是否可用取决于 DeepSeek 当前服务；如模型服务返回错误，应先检查模型名称、Key 和账户状态。
 
 ## 运行终端 Agent
@@ -135,6 +139,27 @@ python src/main.py
 /remember 偏好使用简洁的中文回答
 ```
 
+## 运行 Gateway 与 CLI
+
+在第一个终端启动 Gateway：
+
+```bash
+source .venv/bin/activate
+myclaw gateway run
+```
+
+保持 Gateway 运行，在第二个终端执行：
+
+```bash
+source .venv/bin/activate
+myclaw gateway status
+myclaw chat "请只回复：Gateway 已连接。"
+myclaw sessions list
+myclaw logs --limit 20
+```
+
+CLI 只通过本机 Gateway 请求服务，不会直接读取会话数据库、日志或启动第二个 Agent。
+
 ## 配置并运行 Telegram Agent
 
 1. 在 Telegram 中通过 BotFather 创建 Bot，并获得 Bot Token。
@@ -147,23 +172,21 @@ python src/main.py
    ```
 
 5. 从输出中找到自己的数字用户 ID，填入 `.env` 的 `TELEGRAM_ALLOWED_USER_ID`。
-6. 启动 Telegram Agent：
+6. 在第一个终端启动 Gateway：
+
+   ```bash
+   myclaw gateway run
+   ```
+
+7. 保持 Gateway 运行，在第二个终端启动 Telegram 渠道：
 
    ```bash
    python src/telegram_main.py
    ```
 
-7. 在 Telegram 私聊中发送文字消息。
+8. 在 Telegram 私聊中发送文字消息。
 
-用 `Ctrl+C` 停止 Telegram Agent。Telegram 中的 `/quit` 和 `/exit` 不会停止服务，只会提示继续聊天。
-
-创建短时提醒：
-
-```text
-/remind 10 十秒后的提醒内容
-```
-
-提醒不会调用模型，也不会写入主聊天会话；程序停止后，未触发的提醒会被取消。
+用 `Ctrl+C` 停止 Telegram 渠道。Telegram 中的 `/quit` 和 `/exit` 不会停止服务，只会提示继续聊天。当前 `/remind` 正在迁移到 Gateway 持久化任务，在该迁移完成前不会作为 Telegram 本地功能执行。
 
 ## 运行测试
 
@@ -176,7 +199,7 @@ python -m pytest -q
 当前预期结果：
 
 ```text
-12 passed
+58 passed
 ```
 
 测试覆盖：
@@ -186,6 +209,9 @@ python -m pytest -q
 - 受限笔记拒绝越界路径；
 - 本地会话保存与损坏记录跳过；
 - Telegram 私聊白名单规则；
+- Gateway 会话消息、会话列表与脱敏日志接口；
+- CLI 只能通过 Gateway 请求服务；
+- Telegram 到 Gateway 的稳定会话映射与服务不可用处理；
 - 提醒命令解析与无效参数拒绝。
 
 测试会使用临时目录和临时环境变量，不读取真实会话、笔记或私密配置。
@@ -197,6 +223,7 @@ python -m pytest -q
 - 笔记只能读写受限目录中的单个 Markdown 文件，禁止路径穿越和同名覆盖。
 - 长期记忆必须由 `/remember` 明确授权，普通聊天内容不会自动保存。
 - Telegram 仅允许配置中的单一用户从私聊进入 Agent；群聊和其他用户不会进入模型。
+- Telegram 不直接创建 Agent、读取会话或调度提醒；文字消息只能转发到带 Token 的本机 Gateway。
 - 工具调用次数有限制，未知工具会被拒绝。
 
 如果 Key 或 Token 意外泄露，应立即在对应服务中撤销或重新生成，而不是只删除 Git 历史中的文本。
@@ -217,7 +244,7 @@ python -m pytest -q
 
 ### Bot 没有回复
 
-确认运行的是 `python src/telegram_main.py`，并且消息来自已配置的白名单用户私聊。图片、语音和群聊消息不会进入 Agent。
+确认 Gateway 与 `python src/telegram_main.py` 都在运行，并且消息来自已配置的白名单用户私聊。图片、语音和群聊消息不会进入 Gateway。
 
 ### 天气查询失败
 
