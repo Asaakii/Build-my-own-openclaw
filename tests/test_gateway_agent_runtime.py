@@ -38,6 +38,8 @@ def test_gateway_runtime_isolates_sessions(
         messages: list[dict[str, object]],
         _authorized_memory: str | None,
         _on_tool_start,
+        _allowed_tool_names,
+        _on_tool_denied,
     ) -> str:
         answer = f"回答：{messages[-1]['content']}"
         messages.append(
@@ -88,6 +90,8 @@ def test_failed_model_turn_is_not_saved(
         _messages: list[dict[str, object]],
         _authorized_memory: str | None,
         _on_tool_start,
+        _allowed_tool_names,
+        _on_tool_denied,
     ) -> str:
         raise LLMClientError("测试失败")
 
@@ -105,3 +109,35 @@ def test_failed_model_turn_is_not_saved(
     )
     assert loaded_session.messages == []
     assert loaded_session.summary is None
+
+
+def test_gateway_runtime_passes_restricted_tool_policy(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Gateway 运行器必须把代码级工具白名单传给 Agent 循环。"""
+    runtime = create_runtime(monkeypatch, tmp_path)
+    received_policy: list[object] = []
+
+    def fake_agent_turn(
+        messages: list[dict[str, object]],
+        _authorized_memory: str | None,
+        _on_tool_start,
+        allowed_tool_names,
+        _on_tool_denied,
+    ) -> str:
+        received_policy.append(allowed_tool_names)
+        messages.append({"role": "assistant", "content": "策略已启用"})
+        return "策略已启用"
+
+    monkeypatch.setattr(
+        gateway_agent_runtime,
+        "run_agent_turn",
+        fake_agent_turn,
+    )
+
+    result = runtime.handle_text("local:policy", "测试策略")
+
+    assert result.reply == "策略已启用"
+    assert "write_note" not in received_policy[0]
+    assert "calculate" in received_policy[0]

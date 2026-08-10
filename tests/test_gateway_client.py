@@ -14,6 +14,8 @@ from gateway_client import (
     GatewayLogResult,
     GatewayReminderResult,
     GatewayTaskInfo,
+    GatewayStatus,
+    get_gateway_status,
     list_gateway_tasks,
     list_gateway_sessions,
     send_gateway_message,
@@ -88,6 +90,49 @@ def test_client_sends_message_through_gateway() -> None:
     assert runtime.calls == [
         ("local:client-test", "测试消息")
     ]
+
+
+def test_client_reads_only_safe_gateway_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """状态客户端只接受固定的诊断类别，不接受任意服务端数据。"""
+    monkeypatch.setattr(
+        gateway_client,
+        "request_gateway_json",
+        lambda _request: {
+            "status": "running",
+            "version": "0.1.0",
+            "started_at": "2026-03-07T00:00:00+00:00",
+            "address": "127.0.0.1:18790",
+            "diagnostics": {
+                "agent_runtime": "ready",
+                "state_store": "ready",
+                "reminder_service": "ready",
+                "tool_policy": "restricted",
+            },
+        },
+    )
+
+    status = get_gateway_status(
+        GatewayConfig(
+            host="127.0.0.1",
+            port=18790,
+            token=TEST_TOKEN,
+        )
+    )
+
+    assert status == GatewayStatus(
+        status="running",
+        version="0.1.0",
+        started_at="2026-03-07T00:00:00+00:00",
+        address="127.0.0.1:18790",
+        diagnostics={
+            "agent_runtime": "ready",
+            "state_store": "ready",
+            "reminder_service": "ready",
+            "tool_policy": "restricted",
+        },
+    )
 
 
 def test_client_reports_authentication_failure() -> None:

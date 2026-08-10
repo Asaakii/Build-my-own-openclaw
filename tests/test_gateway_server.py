@@ -99,6 +99,12 @@ def test_status_returns_no_token() -> None:
         assert status_code == 200
         assert payload["status"] == "running"
         assert payload["address"].startswith("127.0.0.1:")
+        assert payload["diagnostics"] == {
+            "agent_runtime": "unavailable",
+            "state_store": "unavailable",
+            "reminder_service": "unavailable",
+            "tool_policy": "restricted",
+        }
         assert TEST_TOKEN not in json.dumps(payload)
 
 

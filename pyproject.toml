@@ -62,6 +62,7 @@ py-modules = [
     "gateway_server",
     "gateway_client",
     "gateway_agent_runtime",
+    "gateway_tool_policy",
 ]
 
 [tool.setuptools.packages.find]

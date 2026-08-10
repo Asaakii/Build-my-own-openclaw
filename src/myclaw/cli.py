@@ -212,6 +212,10 @@ def run_gateway_status() -> int:
                 f"Gateway 版本: {status.version}",
                 f"启动时间: {status.started_at}",
                 f"监听地址: {status.address}",
+                f"Agent 运行器: {status.diagnostics['agent_runtime']}",
+                f"状态存储: {status.diagnostics['state_store']}",
+                f"提醒服务: {status.diagnostics['reminder_service']}",
+                f"工具策略: {status.diagnostics['tool_policy']}",
             ]
         )
     )

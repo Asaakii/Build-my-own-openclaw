@@ -1,5 +1,6 @@
 import json
 import logging
+from collections.abc import Callable, Collection
 
 from openai import (
     APIConnectionError,
@@ -12,7 +13,6 @@ from openai import (
 
 from config import ModelConfig, load_model_config
 from tools import TOOL_DEFINITIONS, execute_tool
-from collections.abc import Callable
 
 
 # 这里固定使用 DeepSeek 作为供应商，后续可以扩展为支持其他供应商
@@ -54,6 +54,7 @@ def request_completion(
     config: ModelConfig,
     messages: list[dict[str, object]],
     use_tools: bool = True,
+    tool_definitions: list[dict[str, object]] | None = None,
 ):
     """向模型发送一次请求；摘要请求可明确关闭工具。"""
     logger.info(
@@ -76,7 +77,12 @@ def request_completion(
 
     # 摘要不需要也不应调用工具。
     if use_tools:
-        request_arguments["tools"] = TOOL_DEFINITIONS
+        # 不同运行入口可提供不同的工具策略；终端仍默认使用完整清单。
+        request_arguments["tools"] = (
+            TOOL_DEFINITIONS
+            if tool_definitions is None
+            else tool_definitions
+        )
 
     try:
         response = client.chat.completions.create(**request_arguments)
@@ -212,17 +218,39 @@ def run_agent_turn(
     messages: list[dict[str, object]],
     authorized_memory_content: str | None = None,
     on_tool_start: Callable[[str], None] | None = None,
+    allowed_tool_names: Collection[str] | None = None,
+    on_tool_denied: Callable[[], None] | None = None,
 ) -> str:
-    """执行一个完整 Agent 回合，期间最多执行 3 次工具。"""
+    """执行一个完整 Agent 回合，期间最多执行 3 次受策略限制的工具。"""
     if not messages:
         raise ValueError("会话不能为空")
 
     config = load_model_config()
     client = create_deepseek_client(config)
     tool_call_count = 0
+    allowed_tools = (
+        frozenset(allowed_tool_names)
+        if allowed_tool_names is not None
+        else None
+    )
+    filtered_tool_definitions = (
+        [
+            definition
+            for definition in TOOL_DEFINITIONS
+            if isinstance(definition.get("function"), dict)
+            and definition["function"].get("name") in allowed_tools
+        ]
+        if allowed_tools is not None
+        else None
+    )
 
     while True:
-        message = request_completion(client, config, messages)
+        message = request_completion(
+            client,
+            config,
+            messages,
+            tool_definitions=filtered_tool_definitions,
+        )
         tool_calls = message.tool_calls
 
         # 没有工具请求时，本轮得到最终自然语言回答。
@@ -260,6 +288,28 @@ def run_agent_turn(
         for tool_call in tool_calls:
             tool_name = tool_call.function.name
             raw_arguments = tool_call.function.arguments
+
+            # 即使模型构造了未在工具清单中的调用，也必须在执行前再次拒绝。
+            if (
+                allowed_tools is not None
+                and tool_name not in allowed_tools
+            ):
+                if on_tool_denied is not None:
+                    on_tool_denied()
+                else:
+                    logger.warning("工具策略拒绝工具请求")
+                tool_result = (
+                    "工具执行失败：当前工具策略不允许此工具"
+                )
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": tool_result,
+                    }
+                )
+                tool_call_count += 1
+                continue
 
             try:
                 arguments = json.loads(raw_arguments)

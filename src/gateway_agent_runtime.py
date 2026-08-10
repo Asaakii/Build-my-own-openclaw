@@ -6,6 +6,7 @@ from agent_runtime import (
     prepare_user_message,
 )
 from context_manager import maybe_compress_history
+from gateway_tool_policy import GATEWAY_ALLOWED_TOOL_NAMES
 from llm_client import LLMClientError, run_agent_turn
 from soul import load_soul
 from sqlite_state_store import (
@@ -47,6 +48,10 @@ class GatewayAgentRuntime:
             tool_name,
         )
 
+    def log_tool_denied(self) -> None:
+        """记录策略拒绝类别，不记录模型请求的工具名称或参数。"""
+        logger.warning("Gateway Agent 工具策略拒绝")
+
     def handle_text(
         self,
         session_id: str,
@@ -83,6 +88,8 @@ class GatewayAgentRuntime:
                 conversation,
                 authorized_memory_content,
                 self.log_tool_start,
+                GATEWAY_ALLOWED_TOOL_NAMES,
+                self.log_tool_denied,
             )
         except (ValueError, LLMClientError, StateStoreError) as error:
             logger.warning(

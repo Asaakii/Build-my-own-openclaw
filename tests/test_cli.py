@@ -80,6 +80,12 @@ def test_gateway_status_uses_gateway_client(
             version="0.1.0",
             started_at="2026-03-07T00:00:00+00:00",
             address="127.0.0.1:18790",
+            diagnostics={
+                "agent_runtime": "ready",
+                "state_store": "ready",
+                "reminder_service": "ready",
+                "tool_policy": "restricted",
+            },
         ),
     )
 
@@ -88,6 +94,7 @@ def test_gateway_status_uses_gateway_client(
     output = capsys.readouterr().out
     assert exit_code == 0
     assert "Gateway 状态: running" in output
+    assert "工具策略: restricted" in output
     assert "test-token" not in output
 
 

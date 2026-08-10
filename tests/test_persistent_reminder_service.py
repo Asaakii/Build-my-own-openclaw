@@ -1,5 +1,6 @@
 from datetime import timedelta
 from pathlib import Path
+import sqlite3
 
 import pytest
 
@@ -141,3 +142,50 @@ def test_invalid_delivery_and_active_task_limit_are_rejected(
 
     with pytest.raises(ReminderTaskError, match="数量已达上限"):
         create_reminder(service)
+
+
+def test_corrupted_pending_task_is_failed_without_delivery(
+    tmp_path: Path,
+) -> None:
+    """损坏的任务记录不能被发送，也不能阻塞后续 Gateway 扫描。"""
+    store = create_store(tmp_path)
+    store.initialize()
+    database_path = tmp_path / "reminders.db"
+    timestamp = "2026-03-07T00:00:00+00:00"
+
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO sessions (
+                session_id, created_at, updated_at
+            )
+            VALUES (?, ?, ?)
+            """,
+            ("telegram:123", timestamp, timestamp),
+        )
+        connection.execute(
+            """
+            INSERT INTO tasks (
+                task_id, session_id, task_type, status,
+                payload_json, due_at, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "broken-task",
+                "telegram:123",
+                "reminder",
+                "pending",
+                "{not-json",
+                timestamp,
+                timestamp,
+                timestamp,
+            ),
+        )
+
+    delivered: list[tuple[dict[str, str], str]] = []
+    service = create_service(store, delivered)
+
+    assert service.process_due_tasks(utc_now()) == 0
+    assert delivered == []
+    assert service.list_tasks()[0].status == "failed"

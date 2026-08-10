@@ -70,6 +70,40 @@ class GatewayHTTPServer(HTTPServer):
             timezone.utc
         ).isoformat()
 
+    def get_diagnostics(self) -> dict[str, str]:
+        """返回最小运行诊断；不访问会话正文、任务正文或私密配置。"""
+        diagnostics = {
+            "agent_runtime": (
+                "ready"
+                if self.agent_runtime is not None
+                else "unavailable"
+            ),
+            "state_store": "unavailable",
+            "reminder_service": (
+                "ready"
+                if self.reminder_service is not None
+                else "unavailable"
+            ),
+            "tool_policy": "restricted",
+        }
+
+        if self.agent_runtime is None:
+            return diagnostics
+
+        try:
+            # 只初始化并验证最小状态层，不读取任何会话或任务内容。
+            self.agent_runtime.state_store.initialize()
+        except (AttributeError, StateStoreError) as error:
+            logger.warning(
+                "Gateway 状态诊断失败: error_type=%s",
+                type(error).__name__,
+            )
+            diagnostics["state_store"] = "degraded"
+            return diagnostics
+
+        diagnostics["state_store"] = "ready"
+        return diagnostics
+
 
 class GatewayRequestHandler(BaseHTTPRequestHandler):
     """处理已经过 Token 保护的 Gateway 最小接口。"""
@@ -100,6 +134,7 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
                         f"{self.server.gateway_config.host}:"
                         f"{self.server.server_port}"
                     ),
+                    "diagnostics": self.server.get_diagnostics(),
                 },
             )
             return
@@ -602,10 +637,17 @@ def sanitize_gateway_log_line(line: str) -> str | None:
                 "Gateway 提醒创建失败"
             )
 
+        if event.startswith("Gateway 状态诊断失败:"):
+            return (
+                f"{prefix}{server_marker}"
+                "Gateway 状态诊断失败"
+            )
+
     if runtime_marker in line:
         prefix, _, event = line.partition(runtime_marker)
         allowed_prefixes = (
             "Gateway Agent 请求工具:",
+            "Gateway Agent 工具策略拒绝",
             "Gateway Agent 回合失败:",
             "Gateway Agent 保存会话失败:",
             "Gateway 会话压缩失败:",

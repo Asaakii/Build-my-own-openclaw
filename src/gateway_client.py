@@ -22,6 +22,7 @@ class GatewayStatus:
     version: str
     started_at: str
     address: str
+    diagnostics: dict[str, str]
 
 
 @dataclass(frozen=True)
@@ -130,14 +131,29 @@ def get_gateway_status(
         "version",
         "started_at",
         "address",
+        "diagnostics",
     )
 
     if (
         not isinstance(payload, dict)
         or any(
-            not isinstance(payload.get(field), str)
+            (
+                not isinstance(payload.get(field), str)
+                if field != "diagnostics"
+                else not isinstance(payload.get(field), dict)
+            )
             for field in required_fields
         )
+        or not all(
+            isinstance(value, str)
+            for value in payload["diagnostics"].values()
+        )
+        or set(payload["diagnostics"]) != {
+            "agent_runtime",
+            "state_store",
+            "reminder_service",
+            "tool_policy",
+        }
     ):
         raise GatewayClientError(
             "Gateway 返回了无效状态数据。"
@@ -148,6 +164,7 @@ def get_gateway_status(
         version=payload["version"],
         started_at=payload["started_at"],
         address=payload["address"],
+        diagnostics=payload["diagnostics"],
     )
 
 
